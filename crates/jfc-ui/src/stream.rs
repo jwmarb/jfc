@@ -54,6 +54,43 @@ const STREAM_INTERRUPT_POLL: Duration = Duration::from_millis(50);
 /// On any I/O failure (full disk, read-only /tmp, ENOSPC) the
 /// fallback is `truncate_tool_result(body)` — better to ship a
 /// truncated in-line version than to silently drop the result.
+/// Delete tool-result spill files older than `max_age`. Called at startup
+/// and on session end to prevent unbounded /tmp growth.
+pub(crate) fn cleanup_tool_result_spills(max_age: std::time::Duration) {
+    let dir = std::env::temp_dir().join("jfc-tool-results");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(max_age)
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    let mut deleted = 0u64;
+    let mut freed = 0u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("txt") {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        let Ok(mtime) = meta.modified() else { continue };
+        if mtime < cutoff {
+            freed += meta.len();
+            if std::fs::remove_file(&path).is_ok() {
+                deleted += 1;
+            }
+        }
+    }
+    if deleted > 0 {
+        tracing::info!(
+            target: "jfc::stream",
+            deleted,
+            freed_bytes = freed,
+            "cleaned up stale tool-result spill files"
+        );
+    }
+}
+
 pub(crate) fn persist_tool_result(body: &str) -> String {
     use std::io::Write as _;
     let dir = std::env::temp_dir().join("jfc-tool-results");
@@ -333,6 +370,28 @@ pub(crate) async fn auto_compact_subagent_history(
     // eviction in that case.
     if messages.len() < 4 {
         return false;
+    }
+
+    // Pre-truncate old tool_result content to 500 chars before building
+    // the compaction transcript. This bounds the compact request's input
+    // so it doesn't itself exceed the model's context window. The most
+    // recent 2 messages are preserved at full fidelity.
+    const PRECOMPACT_MAX_CHARS: usize = 500;
+    let preserve_start = messages.len().saturating_sub(2);
+    for msg in messages.iter_mut().take(preserve_start) {
+        for content in &mut msg.content {
+            if let ProviderContent::ToolResult { content: c, .. } = content {
+                if c.len() > PRECOMPACT_MAX_CHARS {
+                    let boundary = c.floor_char_boundary(PRECOMPACT_MAX_CHARS);
+                    let total = c.len();
+                    *c = format!(
+                        "{}… [pre-compact truncated, {} chars total]",
+                        &c[..boundary],
+                        total
+                    );
+                }
+            }
+        }
     }
 
     let to_summarize_end = messages.len().saturating_sub(2);
@@ -1069,12 +1128,14 @@ pub(crate) fn is_anthropic_tool_input_400(msg: &str) -> bool {
 
 pub(crate) async fn open_stream_with_bedrock_retries(
     provider: &dyn Provider,
-    messages: Vec<ProviderMessage>,
+    messages: Arc<Vec<ProviderMessage>>,
     opts: &StreamOptions,
 ) -> anyhow::Result<EventStream> {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..=BEDROCK_TRANSIENT_400_RETRIES {
-        match provider.stream(messages.clone(), opts).await {
+        // Arc::clone is O(1) — no heap allocation for the messages vec itself.
+        // The provider impl receives Vec<ProviderMessage> by value as before.
+        match provider.stream((*messages).clone(), opts).await {
             Ok(s) => {
                 if attempt > 0 {
                     tracing::info!(
@@ -1183,7 +1244,9 @@ pub async fn stream_response(
 ## Using your tools\n\
 Prefer dedicated tools over Bash when one fits (Read, Write, Edit, Glob, Grep) — reserve Bash for shell-only operations.\n\
 You can call multiple tools in a single response. If you intend to call multiple tools and there are no dependencies between the calls, make all of the independent calls in the same block, otherwise you MUST wait for previous calls to finish first to determine the dependent values (do NOT use placeholders or guess missing parameters).\n\
-If the user provides a specific value for a parameter (for example provided in quotes), make sure to use that value EXACTLY. DO NOT make up values for or ask about optional parameters.";
+If the user provides a specific value for a parameter (for example provided in quotes), make sure to use that value EXACTLY. DO NOT make up values for or ask about optional parameters.\n\
+\n\
+**Tool calls are ground truth.** Never claim that you wrote a file, ran a command, deployed something, edited code, sent a message, or executed any other side-effect unless a successful tool call THIS TURN proves it (Write/Edit/Bash/SendMessage/TeamCreate/etc.). If you intend to perform such an action, you MUST emit the corresponding tool call — describing the action in prose does NOT execute it. If you cannot or did not call the tool, say so explicitly (e.g. \"I haven't written the file yet; calling Write now…\") and then issue the call. Phrases like \"Done\", \"wrote\", \"created\", \"updated\", \"deployed\", \"executed\", \"applied the patch\", or \"now writing for real\" are forbidden unless backed by a completed tool call in the current turn.";
 
     let coding_instructions = "\
 ## Doing tasks\n\
@@ -1208,6 +1271,10 @@ Only use emojis if the user explicitly requests it.\n\
 Your responses should be short and concise.\n\
 When referencing specific functions or pieces of code include the pattern file_path:line_number to allow the user to easily navigate to the source.\n\
 Do not use a colon before tool calls.";
+    // Measure component sizes for budget breakdown before they're consumed by format!.
+    let skills_chars = skills_listing.len();
+    let dispatch_chars = dispatch_section.len();
+    let diagnostics_chars = diagnostics_block.len();
     let mut system_prompt = format!(
         "You are jfc, a coding assistant running as a CLI in the user's terminal. \
          You have direct access to the user's filesystem and shell via tools \
@@ -1254,42 +1321,46 @@ Do not use a colon before tool calls.";
         // inject them into the system prompt. Re-loaded on every stream
         // call so newly-saved memories take effect on the next turn.
         let memories = crate::memory::load_all_memories(&cwd_path);
-        if let Some(memories_section) = crate::memory::render_memories_section(&memories) {
-            system_prompt.push_str(&memories_section);
-        }
 
         // Two-phase memory recall (v132 `bt1` / `xt1` / tengu_memory_survey).
-        // After the bulk-injected memory listing, we ask the model which
-        // memories actually apply to *this* user message and synthesize the
-        // hits into a short `<system-reminder>` block. The bulk listing stays
-        // — it's the cheap-but-coarse signal — and the recall block adds the
-        // expensive-but-targeted layer on top. Configurable via
-        // `Config.memory_recall_enabled` (default on); skipped for empty /
-        // slash-command queries since neither benefits from recall.
+        // When recall produces results, it already contains the relevant
+        // subset of memories — dumping all bodies on top just wastes tokens
+        // re-sending what recall already filtered and summarized.
+        // Configurable via `Config.memory_recall_enabled` (default on);
+        // skipped for empty / slash-command queries since neither benefits
+        // from recall.
         let recall_enabled =
             crate::memory_recall::is_enabled(crate::config::load().memory_recall_enabled);
+        let mut recall_block: Option<String> = None;
         if recall_enabled && !memories.is_empty() {
             let last_user_query = last_user_text(&messages);
             if let Some(query) = last_user_query {
                 let trimmed = query.trim();
                 if !trimmed.is_empty() && !trimmed.starts_with('/') {
-                    let block = crate::memory_recall::run_recall(
+                    recall_block = crate::memory_recall::run_recall(
                         trimmed,
                         &memories,
                         provider.clone(),
                         model.clone(),
                     )
                     .await;
-                    if let Some(b) = block {
-                        tracing::debug!(
-                            target: "jfc::stream",
-                            recall_block_len = b.len(),
-                            "appended memory recall block to system prompt"
-                        );
-                        system_prompt.push_str(&b);
-                    }
                 }
             }
+        }
+
+        // Only inject full memory bodies if recall didn't produce results.
+        // When recall works, it already contains the relevant subset —
+        // dumping all bodies on top just wastes tokens re-sending what
+        // recall already filtered and summarized.
+        if let Some(ref b) = recall_block {
+            tracing::debug!(
+                target: "jfc::stream",
+                recall_block_len = b.len(),
+                "using memory recall block (skipping full memory dump)"
+            );
+            system_prompt.push_str(b);
+        } else if let Some(memories_section) = crate::memory::render_memories_section(&memories) {
+            system_prompt.push_str(&memories_section);
         }
 
         // Auto-context: when the previous turn(s) edited files via
@@ -1325,6 +1396,18 @@ Do not use a colon before tool calls.";
     // gate is at its ship default to avoid prompt churn.
     if let Some(gates) = crate::feature_gates::system_prompt_section() {
         system_prompt.push_str(&gates);
+    }
+
+    // Project document format rules. Only emitted when at least one of
+    // PLAN/ROADMAP/PARITY/PHILOSOPHY/USAGE actually lives in this
+    // workspace — otherwise we'd be pinning prompt cost on contracts
+    // the project hasn't opted into. The slash commands `/plan` etc.
+    // are how these files come into existence; once they do, every
+    // subsequent turn sees the parser anchors so edits stay compliant.
+    let doc_cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    if let Some(doc_rules) = crate::document_formats::system_prompt_section(&doc_cwd) {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(&doc_rules);
     }
 
     // v132 Marsh: drain any bash chunks the streaming tool buffered
@@ -1385,6 +1468,15 @@ Do not use a colon before tool calls.";
     // `modelSupportsThinking` → off, claude.ts:1602).
     let supports_adaptive = model_supports_adaptive_thinking(model.as_str());
     let has_thinking_support = supports_adaptive || model_supports_thinking(model.as_str());
+    tracing::debug!(
+        target: "jfc::stream::budget",
+        skills_chars,
+        dispatch_chars,
+        diagnostics_chars,
+        total_system_chars = system_prompt.len(),
+        estimated_tokens = system_prompt.len() / 4,
+        "system prompt budget breakdown"
+    );
     tracing::info!(
         target: "jfc::stream",
         model = %model,
@@ -1394,6 +1486,8 @@ Do not use a colon before tool calls.";
         tool_count = tools::all_tool_defs().len(),
         "preparing stream request"
     );
+    // Report system prompt size back to App for post-compaction overhead estimate.
+    let _ = tx.try_send(AppEvent::SystemPromptLen(system_prompt.len() / 4));
     let max_out = max_output_tokens_for(model.as_str());
     let mut advertised_tools = tools::all_tool_defs_with_mcp().await;
 
@@ -1450,6 +1544,11 @@ Do not use a colon before tool calls.";
         if let Some(effort) = crate::effort::active_global() {
             base = base.reasoning_effort(effort);
         }
+        // Fast mode: read the process-global flag published by `set_fast_mode_global`
+        // when the user toggles `/fast`. Flows into the `anthropic-beta` header.
+        if crate::effort::active_fast_mode() {
+            base = base.fast_mode(true);
+        }
         if supports_adaptive {
             base.adaptive()
         } else if has_thinking_support {
@@ -1477,9 +1576,12 @@ Do not use a colon before tool calls.";
             .with_extra("message_count", messages.len().to_string()),
     );
 
+    // Wrap in Arc so the retry loop and thinking-fallback path share the same
+    // allocation instead of cloning the full Vec<ProviderMessage> on each attempt.
+    let messages = Arc::new(messages);
     let mut stream = match open_stream_with_bedrock_retries(
         provider.as_ref(),
-        messages.clone(),
+        Arc::clone(&messages),
         &opts,
     )
     .await
@@ -1499,11 +1601,12 @@ Do not use a colon before tool calls.";
                     error = %e,
                     "stream rejected thinking parameter — retrying without thinking"
                 );
+                // Reuse opts fields by ref — avoid cloning system prompt + tool defs.
                 let fallback_opts = StreamOptions::new(opts.model.clone())
-                    .system(opts.system.clone().unwrap_or_default())
+                    .system(opts.system.as_deref().unwrap_or_default().to_owned())
                     .tools(opts.tools.clone())
                     .max_tokens(opts.max_tokens);
-                match open_stream_with_bedrock_retries(provider.as_ref(), messages, &fallback_opts)
+                match open_stream_with_bedrock_retries(provider.as_ref(), Arc::clone(&messages), &fallback_opts)
                     .await
                 {
                     Ok(s) => s,
@@ -1592,7 +1695,11 @@ Do not use a colon before tool calls.";
 
         match event {
             StreamEvent::TextDelta { delta, .. } => {
-                // High-frequency token stream; safe to drop — next chunk supersedes.
+                // Send delta directly — coalescing via poll would require
+                // unsafe waker usage. The AppEvent channel is bounded; try_send
+                // drops if full which already provides back-pressure.
+                // (dhat mirror-pair #1/#2 will be addressed by Arc<str> in a
+                // follow-up; for now we keep the existing per-token path)
                 if tx
                     .try_send(AppEvent::StreamChunk {
                         text: Some(delta),
@@ -1604,7 +1711,6 @@ Do not use a colon before tool calls.";
                 }
             }
             StreamEvent::ThinkingDelta { delta, .. } => {
-                // High-frequency token stream; safe to drop — next chunk supersedes.
                 if tx
                     .try_send(AppEvent::StreamChunk {
                         text: None,
@@ -1728,6 +1834,41 @@ Do not use a colon before tool calls.";
                     }
                 };
                 tool_accum.remove(&index);
+                // Server-side tools (web_search, code_execution) are executed
+                // by Anthropic's infrastructure — jfc must NOT dispatch them.
+                // Mark them Completed immediately so the event_loop routes them
+                // to the messages view as a visual record without ever calling
+                // execute_tool. Results arrive via a subsequent `tool_result`
+                // content block in the next user message.
+                let tool = if matches!(
+                    tool.kind,
+                    ToolKind::ServerWebSearch | ToolKind::ServerCodeExecution
+                ) {
+                    let mut t = tool;
+                    let display_text = match t.kind {
+                        ToolKind::ServerWebSearch => format!(
+                            "🔍 Executed server-side by Anthropic ({})",
+                            t.input.summary()
+                        ),
+                        ToolKind::ServerCodeExecution => format!(
+                            "⚡ Executed server-side by Anthropic ({})",
+                            t.input.summary()
+                        ),
+                        _ => unreachable!(),
+                    };
+                    t.output = ToolOutput::Text(display_text);
+                    let _ = t.mark_running();
+                    let _ = t.mark_completed();
+                    tracing::info!(
+                        target: "jfc::stream",
+                        tool_kind = t.kind.label(),
+                        tool_use_id = %tool_use_id,
+                        "server-side tool marked completed (no local dispatch)"
+                    );
+                    t
+                } else {
+                    tool
+                };
                 let _ = tx.send(AppEvent::StreamTool(tool)).await;
             }
             StreamEvent::Done { stop_reason: r } => {
@@ -1765,18 +1906,24 @@ Do not use a colon before tool calls.";
                     cache_read_tokens, cache_write_tokens,
                     "stream usage report"
                 );
-                // Usage stats are non-critical; safe to drop under backpressure.
-                if tx
-                    .try_send(AppEvent::StreamUsage {
+                // StreamUsage is CRITICAL state, not telemetry. It
+                // calibrates the context gauge, calibrates the pre-submit
+                // compaction gate, and stamps `usage` onto the streaming
+                // assistant message so session-resume can pick up where
+                // we left off. Dropping it under backpressure used to
+                // leave the gauge stale at the previous turn's count
+                // until a much later usage event suddenly snapped it
+                // forward — the "60k jumped to 500k" symptom users
+                // reported. Use `send().await` so the event waits for
+                // channel capacity instead.
+                let _ = tx
+                    .send(AppEvent::StreamUsage {
                         input_tokens,
                         output_tokens,
                         cache_read_tokens,
                         cache_write_tokens,
                     })
-                    .is_err()
-                {
-                    tracing::trace!(target: "jfc::stream", "StreamUsage dropped (buffer full)");
-                }
+                    .await;
             }
             StreamEvent::Error { message } => {
                 tracing::error!(target: "jfc::stream", %message, "stream error event");
@@ -1919,7 +2066,7 @@ pub fn dispatch_tools_batched(
             };
 
             let teammate_event_tx = teammate_event_tx.clone();
-            let (runner_task_id, _abort_tx) =
+            let (runner_task_id, abort_tx) =
                 crate::swarm::runner::start_teammate(config, teammate_event_tx);
             let _ = runner_task_id;
 
@@ -1998,12 +2145,26 @@ pub fn dispatch_tools_batched(
                     .ok()
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_default(),
+                // Hand the abort handle to the main loop. It moves into
+                // app.team_context.teammates[agent_id].abort_tx where it
+                // stays alive for the teammate's lifetime. Previously the
+                // sender was named `_abort_tx` and dropped on the next
+                // line, immediately closing the channel and forcing the
+                // runner into an Aborted exit on its first stream poll.
+                abort_tx: Some(abort_tx),
             });
             let _ = tx_task.try_send(AppEvent::TaskStarted {
                 task_id: crate::ids::TaskId::from(runner_task_id.clone()),
                 description: format!("spawn teammate: {name}"),
                 model_used: Some(teammate_model_name),
                 max_input_tokens: agent_def.and_then(|a| a.max_input_tokens),
+                // Teammates are in-process (the runner runs inside this
+                // event loop) — DON'T let the UI's TaskStarted handler
+                // register them as detached daemon workers. The daemon
+                // reconciler would later mark them stale when the UI
+                // exits, mis-labeling foreground teammates as Failed.
+                is_detached: false,
+                parent_task_id: task_input.parent_task_id.clone(),
             });
 
             let _ = tx_task.try_send(AppEvent::ToolResult {
@@ -2083,6 +2244,14 @@ pub fn dispatch_tools_batched(
                         description: description.clone(),
                         model_used: model_used.clone(),
                         max_input_tokens,
+                        // True detached background worker: the worker
+                        // process already called
+                        // `record_background_agent_started_at` with its
+                        // own PID + launch_path. The UI's TaskStarted
+                        // handler must skip the registry write so it
+                        // doesn't clobber that record.
+                        is_detached: true,
+                        parent_task_id: task_input.parent_task_id.clone(),
                     });
                     let result_json = serde_json::json!({
                         "status": "background_task_started",
@@ -2176,6 +2345,12 @@ pub fn dispatch_tools_batched(
                     description: description.clone(),
                     model_used: model_used.clone(),
                     max_input_tokens,
+                    // In-process subagent (foreground Task tool, no
+                    // `run_in_background`). Skip daemon registration; the
+                    // BackgroundTask row in `app.background_tasks` is the
+                    // authoritative UI state.
+                    is_detached: false,
+                    parent_task_id: task_input.parent_task_id.clone(),
                 })
                 .await;
             let started = std::time::Instant::now();
@@ -2193,12 +2368,12 @@ pub fn dispatch_tools_batched(
             let cwd_override = worktree_info
                 .as_ref()
                 .map(|(info, _)| std::path::PathBuf::from(&info.path));
-            crate::daemon::record_background_agent_started(
-                &task_id,
-                &description,
-                model_used.clone(),
-                cwd_override.clone(),
-            );
+            // No daemon registration for in-process subagents — they're
+            // tracked via `app.background_tasks` and the assistant
+            // message's TaskStatus parts. Previously this call planted
+            // them in the daemon roster too, where the reconciler would
+            // later mark them stale at UI exit, confusing the next
+            // session's restored "background agents" list.
             let result = crate::tools::execute_task(
                 &task_input,
                 provider_task.as_ref(),
@@ -2446,6 +2621,13 @@ pub async fn continue_agentic_loop(app: &mut App, tx: &mpsc::Sender<AppEvent>) {
     app.streaming_last_token_at = Some(now);
     app.last_usage_output = 0;
     app.usage_apply_baseline = (0, 0, 0, 0);
+    // Clear the thinking timestamps so the next sub-stream's spinner doesn't
+    // render a stale "thought for Ns · almost done thinking" while the new
+    // request is still in-flight. The next ThinkingDelta event will re-stamp
+    // `thinking_started_at`; if the new turn isn't an extended-thinking one,
+    // the spinner correctly shows the composing state instead.
+    app.thinking_started_at = None;
+    app.thinking_ended_at = None;
 
     let provider = app.provider.clone();
     let messages = build_provider_messages_with_tool_results(&app.messages[..assistant_idx]);
@@ -2581,9 +2763,14 @@ fn model_supports_thinking(model: &str) -> bool {
 }
 
 pub fn build_provider_messages(msgs: &[ChatMessage]) -> Vec<ProviderMessage> {
-    let out: Vec<ProviderMessage> = msgs
+    let mut out: Vec<ProviderMessage> = msgs
         .iter()
         .filter_map(|m| {
+            // Same guard as `build_provider_messages_with_tool_results`:
+            // skip queued placeholders. See the longer rationale there.
+            if m.queued {
+                return None;
+            }
             let role = match m.role {
                 Role::User => ProviderRole::User,
                 Role::Assistant => ProviderRole::Assistant,
@@ -2592,17 +2779,48 @@ pub fn build_provider_messages(msgs: &[ChatMessage]) -> Vec<ProviderMessage> {
                 .parts
                 .iter()
                 .filter_map(|p| match p {
-                    MessagePart::Text(t) if !t.is_empty() => Some(t.as_str()),
+                    MessagePart::Text(t) if !t.is_empty() => Some(t.to_owned()),
+                    // Serialize TaskStatus parts as inline text so the
+                    // model sees completed background agent summaries.
+                    // Without this, detached agents could finish and
+                    // update the UI, but the model never knew.
+                    MessagePart::TaskStatus(ts) if ts.summary.is_some() || ts.error.is_some() => {
+                        let status_label = format!("{:?}", ts.status);
+                        let body = ts
+                            .summary
+                            .as_deref()
+                            .or(ts.error.as_deref())
+                            .unwrap_or("(no output)");
+                        // Cap at 2000 chars to prevent unbounded prompt growth —
+                        // TaskStatus summaries replay every turn and accumulate fast.
+                        let body = if body.len() > 2000 {
+                            format!("{}… [truncated {} chars]", &body[..body.floor_char_boundary(2000)], body.len())
+                        } else {
+                            body.to_string()
+                        };
+                        Some(format!(
+                            "[Background agent: {} ({status_label})] {body}",
+                            ts.description
+                        ))
+                    }
                     _ => None,
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            if text.is_empty() {
+            if text.is_empty() && m.attachments.is_empty() {
                 return None;
+            }
+            let mut content: Vec<ProviderContent> = Vec::new();
+            if !text.is_empty() {
+                content.push(ProviderContent::Text(text));
+            }
+            // Prompt-local attachments (pasted images) owned by this message
+            for att in &m.attachments {
+                content.push(ProviderContent::Attachment(att.clone()));
             }
             Some(ProviderMessage {
                 role,
-                content: vec![ProviderContent::Text(text)],
+                content,
             })
         })
         .collect();
@@ -2612,7 +2830,9 @@ pub fn build_provider_messages(msgs: &[ChatMessage]) -> Vec<ProviderMessage> {
         output_messages = out.len(),
         "build_provider_messages (text-only)"
     );
-    ensure_user_last(out)
+    let out = ensure_user_last(out);
+    validate_provider_messages(&out);
+    out
 }
 
 /// Ensure the message list ends with a user-role message before sending to
@@ -2685,10 +2905,23 @@ fn ensure_user_last(mut msgs: Vec<ProviderMessage>) -> Vec<ProviderMessage> {
     // messages happen when: (a) a compact_boundary (assistant) is followed by
     // a text-only assistant, (b) queued prompts produce adjacent user
     // messages, (c) filtering removes messages and collapses the alternation.
+    //
+    // CRITICAL: do NOT merge across a `tool_result` boundary. Anthropic's
+    // Messages API validates that any user message containing a
+    // `tool_result` block contains ONLY tool_result blocks (and that the
+    // immediately-preceding assistant message contained matching
+    // `tool_use` IDs). Merging a tool_result user message with a normal
+    // text user message produces a mixed-content user turn that either
+    // gets rejected with `invalid_request_error` or — worse on lenient
+    // gateways — teaches the model that tool results are interchangeable
+    // with chat text. Same rule for the inverse direction.
     let mut merged: Vec<ProviderMessage> = Vec::with_capacity(msgs.len());
     for msg in msgs {
         if let Some(last) = merged.last_mut() {
-            if last.role == msg.role {
+            if last.role == msg.role
+                && !contains_tool_result(last)
+                && !contains_tool_result(&msg)
+            {
                 last.content.extend(msg.content);
                 continue;
             }
@@ -2698,12 +2931,150 @@ fn ensure_user_last(mut msgs: Vec<ProviderMessage>) -> Vec<ProviderMessage> {
     merged
 }
 
+/// True iff the message carries any `ProviderContent::ToolResult` block.
+/// Used by `ensure_user_last` to enforce Anthropic's tool_result purity
+/// rule: a user message that contains tool_result MUST contain only
+/// tool_result, and must not be merged with adjacent normal-text user
+/// messages.
+fn contains_tool_result(msg: &ProviderMessage) -> bool {
+    msg.content
+        .iter()
+        .any(|c| matches!(c, ProviderContent::ToolResult { .. }))
+}
+
+/// Debug-only validator for the post-merge provider message stream.
+///
+/// Anthropic's Messages API enforces several invariants that JFC's
+/// `build_provider_messages*` mutations could violate:
+///
+/// 1. A user message containing `tool_result` MUST contain ONLY
+///    tool_result blocks (no text, no images, no other types).
+/// 2. A `tool_result` user message MUST be immediately preceded by an
+///    assistant message that contains the matching `tool_use` IDs.
+/// 3. Every `tool_use` ID in an assistant message MUST have a matching
+///    `tool_result` in the next user message.
+///
+/// In debug builds we log loud warnings when any of these are violated
+/// so the regression is visible in trace logs before the provider 400s
+/// the request. In release builds this is a no-op. We don't BLOCK the
+/// send — the gateway may be lenient, and a forensic log is more useful
+/// than a hard panic.
+#[cfg(debug_assertions)]
+fn validate_provider_messages(msgs: &[ProviderMessage]) {
+    use std::collections::HashSet;
+    for (i, msg) in msgs.iter().enumerate() {
+        if matches!(msg.role, ProviderRole::User) && contains_tool_result(msg) {
+            // Invariant 1: tool_result purity.
+            let non_tool_result = msg
+                .content
+                .iter()
+                .any(|c| !matches!(c, ProviderContent::ToolResult { .. }));
+            if non_tool_result {
+                tracing::warn!(
+                    target: "jfc::stream::invariants",
+                    msg_index = i,
+                    content_kinds = ?msg.content.iter().map(|c| match c {
+                        ProviderContent::Text(_) => "text",
+                        ProviderContent::ToolUse { .. } => "tool_use",
+                        ProviderContent::ToolResult { .. } => "tool_result",
+                        ProviderContent::Attachment(_) => "attachment",
+                    }).collect::<Vec<_>>(),
+                    "provider message invariant violation: user message contains tool_result mixed with other content"
+                );
+            }
+            // Invariant 2: must follow an assistant with matching tool_use IDs.
+            let tool_result_ids: HashSet<&str> = msg
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    ProviderContent::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if let Some(prev) = i.checked_sub(1).and_then(|j| msgs.get(j)) {
+                if !matches!(prev.role, ProviderRole::Assistant) {
+                    tracing::warn!(
+                        target: "jfc::stream::invariants",
+                        msg_index = i,
+                        prev_role = ?prev.role,
+                        "provider message invariant violation: tool_result user message not preceded by assistant"
+                    );
+                } else {
+                    let tool_use_ids: HashSet<&str> = prev
+                        .content
+                        .iter()
+                        .filter_map(|c| match c {
+                            ProviderContent::ToolUse { id, .. } => Some(id.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    let missing: Vec<&str> = tool_result_ids
+                        .difference(&tool_use_ids)
+                        .copied()
+                        .collect();
+                    let unmatched: Vec<&str> = tool_use_ids
+                        .difference(&tool_result_ids)
+                        .copied()
+                        .collect();
+                    if !missing.is_empty() || !unmatched.is_empty() {
+                        tracing::warn!(
+                            target: "jfc::stream::invariants",
+                            msg_index = i,
+                            tool_result_without_use = ?missing,
+                            tool_use_without_result = ?unmatched,
+                            "provider message invariant violation: tool_use ↔ tool_result IDs do not match"
+                        );
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    target: "jfc::stream::invariants",
+                    msg_index = i,
+                    "provider message invariant violation: leading tool_result user message"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn validate_provider_messages(_msgs: &[ProviderMessage]) {}
+
 fn build_provider_messages_with_tool_results(msgs: &[ChatMessage]) -> Vec<ProviderMessage> {
+    // Microcompact: truncate old tool outputs to save context for the
+    // current task. Mirrors OpenCode's microcompact behavior.
+    const MICROCOMPACT_TURN_THRESHOLD: usize = 10;
+    const MICROCOMPACT_MAX_CHARS: usize = 500;
+
+    // Pre-compute turns_ago for each message index by counting user-role
+    // messages from the end backward.
+    let mut turns_ago_map: Vec<usize> = vec![0; msgs.len()];
+    {
+        let mut user_turns_seen = 0usize;
+        for i in (0..msgs.len()).rev() {
+            if msgs[i].role == Role::User && !msgs[i].queued {
+                user_turns_seen += 1;
+            }
+            turns_ago_map[i] = user_turns_seen;
+        }
+    }
+
     let mut out = Vec::new();
     let mut tool_use_count = 0usize;
     let mut tool_result_count = 0usize;
     let mut abandoned_count = 0usize;
-    for m in msgs {
+    for (msg_idx, m) in msgs.iter().enumerate() {
+        // Skip queued-prompt placeholders. They're real ChatMessages in
+        // `app.messages` (so the user can see them rendered with the
+        // ⏳/⚙ glyph) but they MUST NOT be sent to the provider until
+        // `drain_queued_prompts` promotes them — otherwise an agentic
+        // continuation that fires while the queue is filling would
+        // serialize the queued user prompt as part of the current turn,
+        // inflating the prompt size and triggering the "context jumped
+        // after I queued a message" symptom.
+        if m.queued {
+            continue;
+        }
         let role = match m.role {
             Role::User => ProviderRole::User,
             Role::Assistant => ProviderRole::Assistant,
@@ -2712,7 +3083,27 @@ fn build_provider_messages_with_tool_results(msgs: &[ChatMessage]) -> Vec<Provid
             .parts
             .iter()
             .filter_map(|p| match p {
-                MessagePart::Text(t) if !t.is_empty() => Some(t.as_str()),
+                MessagePart::Text(t) if !t.is_empty() => Some(t.to_owned()),
+                // Same TaskStatus serialization as build_provider_messages.
+                MessagePart::TaskStatus(ts) if ts.summary.is_some() || ts.error.is_some() => {
+                    let status_label = format!("{:?}", ts.status);
+                    let body = ts
+                        .summary
+                        .as_deref()
+                        .or(ts.error.as_deref())
+                        .unwrap_or("(no output)");
+                    // Cap at 2000 chars to prevent unbounded prompt growth —
+                    // TaskStatus summaries replay every turn and accumulate fast.
+                    let body = if body.len() > 2000 {
+                        format!("{}… [truncated {} chars]", &body[..body.floor_char_boundary(2000)], body.len())
+                    } else {
+                        body.to_string()
+                    };
+                    Some(format!(
+                        "[Background agent: {} ({status_label})] {body}",
+                        ts.description
+                    ))
+                }
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -2751,27 +3142,30 @@ fn build_provider_messages_with_tool_results(msgs: &[ChatMessage]) -> Vec<Provid
                     let (result_text, is_error) = match tc.status {
                         ToolStatus::Completed | ToolStatus::Failed => {
                             tool_result_count += 1;
-                            let text = match &tc.output {
-                                ToolOutput::Text(s) => s.clone(),
-                                ToolOutput::LargeText(lt) => lt.content.clone(),
+                            // Use Cow<str> to avoid cloning when the output is already
+                            // a borrowed str we can reference directly (Text/LargeText).
+                            // Only allocate for variants that require formatting.
+                            let text: std::borrow::Cow<str> = match &tc.output {
+                                ToolOutput::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+                                ToolOutput::LargeText(lt) => std::borrow::Cow::Borrowed(lt.content.as_str()),
                                 ToolOutput::Command {
                                     stdout,
                                     stderr,
                                     exit_code,
-                                } => format!(
+                                } => std::borrow::Cow::Owned(format!(
                                     "exit: {}\nstdout: {}\nstderr: {}",
                                     exit_code.unwrap_or(-1),
                                     stdout,
                                     stderr
-                                ),
-                                ToolOutput::FileContent { content, .. } => content.clone(),
-                                ToolOutput::FileList(files) => files.join("\n"),
+                                )),
+                                ToolOutput::FileContent { content, .. } => std::borrow::Cow::Borrowed(content.as_str()),
+                                ToolOutput::FileList(files) => std::borrow::Cow::Owned(files.join("\n")),
                                 ToolOutput::Diff(d) => {
-                                    format!("Applied diff to {}", d.file_path)
+                                    std::borrow::Cow::Owned(format!("Applied diff to {}", d.file_path))
                                 }
-                                ToolOutput::Empty => String::new(),
+                                ToolOutput::Empty => std::borrow::Cow::Borrowed(""),
                             };
-                            (text, tc.status == ToolStatus::Failed)
+                            (text.into_owned(), tc.status == ToolStatus::Failed)
                         }
                         ToolStatus::Cancelled => {
                             abandoned_count += 1;
@@ -2811,9 +3205,25 @@ fn build_provider_messages_with_tool_results(msgs: &[ChatMessage]) -> Vec<Provid
                             )
                         }
                     };
+                    // Microcompact: for messages > MICROCOMPACT_TURN_THRESHOLD
+                    // user turns ago, cap tool_result content to preserve context
+                    // for the current task.
+                    let capped = cap_tool_result(&result_text);
+                    let content = if turns_ago_map[msg_idx] > MICROCOMPACT_TURN_THRESHOLD
+                        && capped.len() > MICROCOMPACT_MAX_CHARS
+                    {
+                        let boundary = capped.floor_char_boundary(MICROCOMPACT_MAX_CHARS);
+                        format!(
+                            "{}… [older output truncated, {} chars total]",
+                            &capped[..boundary],
+                            capped.len()
+                        )
+                    } else {
+                        capped
+                    };
                     Some(ProviderContent::ToolResult {
                         tool_use_id: tc.id.as_str().to_owned(),
-                        content: cap_tool_result(&result_text),
+                        content,
                         is_error,
                     })
                 }
@@ -2826,6 +3236,10 @@ fn build_provider_messages_with_tool_results(msgs: &[ChatMessage]) -> Vec<Provid
             assistant_content.push(ProviderContent::Text(text.clone()));
         }
         assistant_content.extend(tool_uses);
+        // Prompt-local attachments (pasted images) owned by this message
+        for att in &m.attachments {
+            assistant_content.push(ProviderContent::Attachment(att.clone()));
+        }
 
         if !assistant_content.is_empty() {
             out.push(ProviderMessage {
@@ -2846,75 +3260,39 @@ fn build_provider_messages_with_tool_results(msgs: &[ChatMessage]) -> Vec<Provid
             });
         }
     }
-    // Drain attachments staged by tool dispatchers (currently: PDFs
-    // ingested by Read). Append them to the LAST user-role message
-    // — that's the tool_results message we just emitted in the loop
-    // above when a Read tool just ran, or the user's prompt when no
-    // tool fired. Skipping the append here would silently lose the
-    // PDF, so this is the load-bearing wire.
-    let pending = crate::tools::take_pending_tool_attachments();
-    let pending_count = pending.len();
-    if !pending.is_empty() {
-        let attached: Vec<ProviderContent> = pending
-            .into_iter()
-            .map(ProviderContent::Attachment)
-            .collect();
-        // Find the last user message and append; if none exists,
-        // create one (defensive — `ensure_user_last` enforces this
-        // anyway, but doing it eagerly keeps the message structure
-        // predictable).
-        if let Some(last_user) = out
-            .iter_mut()
-            .rfind(|m| matches!(m.role, ProviderRole::User))
-        {
-            last_user.content.extend(attached);
-        } else {
-            out.push(ProviderMessage {
-                role: ProviderRole::User,
-                content: attached,
-            });
-        }
-    }
+    // Attachments owned by each message are already serialized in the
+    // loop above via `ProviderContent::Attachment` blocks. The global
+    // pending-tool-attachment queue no longer exists; all attachments
+    // travel via per-message `ChatMessage.attachments` fields.
     tracing::debug!(
         target: "jfc::stream",
         input_messages = msgs.len(),
         output_messages = out.len(),
-        tool_use_count, tool_result_count, abandoned_count, pending_count,
+        tool_use_count, tool_result_count, abandoned_count,
         "build_provider_messages_with_tool_results"
     );
-    ensure_user_last(out)
+    let out = ensure_user_last(out);
+    validate_provider_messages(&out);
+    out
 }
 
 #[cfg(test)]
-mod pdf_attachment_drain_tests {
+mod attachment_tests {
     use super::*;
     use crate::types::ChatMessage;
 
-    /// Test-isolation lock so this module's tests serialize their
-    /// access to the process-global pending-attachments queue.
-    /// Otherwise running two tests in parallel would leak state
-    /// between them and break the queue-empty assertions.
-    fn drain_test_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-    }
-
-    /// Normal: when a PDF is staged via push_pending_tool_attachment,
-    /// build_provider_messages_with_tool_results drains the queue
-    /// and appends an Attachment content block to the LAST user
-    /// message. Without this glue the model never sees the PDF.
+    /// Normal: PDF on ChatMessage.attachments lands as ProviderContent::Attachment
+    /// in build_provider_messages_with_tool_results. Per-message ownership —
+    /// no global queue.
     #[test]
-    fn pending_pdf_lands_in_last_user_message_normal() {
-        let _guard = drain_test_lock().lock().unwrap_or_else(|p| p.into_inner());
-        let _ = crate::tools::take_pending_tool_attachments();
-
-        let pdf = crate::attachments::Attachment {
+    fn per_message_pdf_lands_in_user_message_normal() {
+        let mut user = ChatMessage::user("read this please".to_string());
+        user.attachments = vec![crate::attachments::Attachment {
+            id: 0,
             kind: crate::attachments::AttachmentKind::ApplicationPdf,
             bytes: b"%PDF-1.7\nfake".to_vec(),
-        };
-        crate::tools::push_pending_tool_attachment(pdf);
-
-        let msgs = vec![ChatMessage::user("read this please".to_string())];
+        }];
+        let msgs = vec![user];
         let provider_msgs = build_provider_messages_with_tool_results(&msgs);
         let last_user = provider_msgs
             .iter()
@@ -2925,40 +3303,55 @@ mod pdf_attachment_drain_tests {
             .iter()
             .filter(|c| matches!(c, ProviderContent::Attachment(_)))
             .count();
-        assert_eq!(
-            attachment_count, 1,
-            "expected exactly one attachment on the last user message"
-        );
+        assert_eq!(attachment_count, 1, "expected one attachment on the user message");
     }
 
-    /// Robust: a second build_provider_messages_with_tool_results
-    /// call AFTER the drain must NOT see the PDF again — the queue
-    /// should be empty so the same attachment doesn't replay every
-    /// turn (which would balloon token cost and produce duplicate
-    /// document blocks).
+    /// Normal: pasted image on ChatMessage.attachments lands in the text-only
+    /// build path.
     #[test]
-    fn drain_clears_pending_queue_robust() {
-        let _guard = drain_test_lock().lock().unwrap_or_else(|p| p.into_inner());
-        let _ = crate::tools::take_pending_tool_attachments();
-
-        let pdf = crate::attachments::Attachment {
-            kind: crate::attachments::AttachmentKind::ApplicationPdf,
-            bytes: b"%PDF-1.7\n".to_vec(),
-        };
-        crate::tools::push_pending_tool_attachment(pdf);
-
-        let msgs = vec![ChatMessage::user("first".to_string())];
-        let _first_round = build_provider_messages_with_tool_results(&msgs);
-        let second_round = build_provider_messages_with_tool_results(&msgs);
-        let attachment_count = second_round
+    fn per_message_image_lands_in_text_only_build_normal() {
+        let mut msg = ChatMessage::user("look at this [Image #1]".to_string());
+        msg.attachments = vec![crate::attachments::Attachment {
+            id: 1,
+            kind: crate::attachments::AttachmentKind::ImagePng,
+            bytes: vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A],
+        }];
+        let msgs = vec![msg];
+        let provider_msgs = build_provider_messages(&msgs);
+        let last_user = provider_msgs
             .iter()
-            .flat_map(|m| m.content.iter())
+            .rfind(|m| matches!(m.role, ProviderRole::User))
+            .expect("must have a user message");
+        let attachment_count = last_user
+            .content
+            .iter()
             .filter(|c| matches!(c, ProviderContent::Attachment(_)))
             .count();
-        assert_eq!(
-            attachment_count, 0,
-            "second build must not replay the drained attachment"
-        );
+        assert_eq!(attachment_count, 1, "expected one attachment in text-only path");
+    }
+
+    /// Robust: a second call for the same messages does NOT produce a second
+    /// copy of the attachment (no shared mutable queue to drain twice).
+    #[test]
+    fn second_build_does_not_duplicate_attachment_robust() {
+        let mut user = ChatMessage::user("first".to_string());
+        user.attachments = vec![crate::attachments::Attachment {
+            id: 0,
+            kind: crate::attachments::AttachmentKind::ApplicationPdf,
+            bytes: b"%PDF-1.7\n".to_vec(),
+        }];
+        let msgs = vec![user];
+        let first = build_provider_messages_with_tool_results(&msgs);
+        let second = build_provider_messages_with_tool_results(&msgs);
+        // Both runs should see exactly one attachment — no global state to drain.
+        for round in [&first, &second] {
+            let count = round
+                .iter()
+                .flat_map(|m| m.content.iter())
+                .filter(|c| matches!(c, ProviderContent::Attachment(_)))
+                .count();
+            assert_eq!(count, 1, "each build should see exactly one attachment");
+        }
     }
 }
 
@@ -3299,6 +3692,8 @@ mod build_provider_messages_tests {
             cost_tier: None,
             elapsed: None,
             usage: None,
+            queued: false,
+            attachments: Vec::new(),
         };
         let out = build_provider_messages(&[m]);
         assert_eq!(out.len(), 1);
@@ -3320,6 +3715,8 @@ mod build_provider_messages_tests {
             cost_tier: None,
             elapsed: None,
             usage: None,
+            queued: false,
+            attachments: Vec::new(),
         };
         let out = build_provider_messages(&[m]);
         // Empty input → nothing emitted, ensure_user_last leaves the result

@@ -37,8 +37,8 @@ fn restart_stream_in_place(
     msg.elapsed = None;
     msg.usage = None;
 
-    app.streaming_text.clear();
-    app.streaming_reasoning.clear();
+    app.streaming_text = String::new();
+    app.streaming_reasoning = String::new();
     app.streaming_response_bytes = 0;
     app.streaming_assistant_idx = Some(assistant_idx);
     app.is_streaming = true;
@@ -151,18 +151,41 @@ async fn drain_queued_prompts(app: &mut App, tx: &mpsc::Sender<AppEvent>) {
     let mut non_meta_texts: Vec<String> = Vec::with_capacity(total - meta_count);
     let mut first_non_meta_text: Option<String> = None;
     for qp in drained {
-        let crate::app::QueuedPrompt { text, is_meta } = qp;
+        let crate::app::QueuedPrompt {
+            text,
+            is_meta,
+            attachments,
+        } = qp;
         let glyph = if is_meta { "⚙" } else { "⏳" };
         let placeholder = format!("{glyph} {text}");
         for msg in app.messages.iter_mut() {
             if msg.role == Role::User {
+                let mut replaced = false;
                 for part in msg.parts.iter_mut() {
                     if let MessagePart::Text(t) = part {
                         if *t == placeholder {
                             *t = text.clone();
+                            replaced = true;
                             break;
                         }
                     }
+                }
+                // Promotion: clear the `queued` flag and attach images
+                // so `build_provider_messages*` includes this message
+                // (with its attachments) in the next turn.
+                if replaced {
+                    if msg.queued {
+                        msg.queued = false;
+                    }
+                    if !attachments.is_empty() {
+                        tracing::info!(
+                            target: "jfc::ui::queue",
+                            count = attachments.len(),
+                            "drain_queued_prompts: attaching images to promoted message"
+                        );
+                        msg.attachments = attachments;
+                    }
+                    break;
                 }
             }
         }
@@ -246,8 +269,8 @@ async fn drain_queued_prompts(app: &mut App, tx: &mpsc::Sender<AppEvent>) {
     let _ = first_non_meta_text;
 
     app.messages.push(ChatMessage::assistant(String::new()));
-    app.streaming_text.clear();
-    app.streaming_reasoning.clear();
+    app.streaming_text = String::new();
+    app.streaming_reasoning = String::new();
     app.streaming_response_bytes = 0;
     app.streaming_assistant_idx = Some(assistant_idx);
     app.is_streaming = true;
@@ -323,13 +346,100 @@ async fn maybe_continue_task_factory(app: &mut App, tx: &mpsc::Sender<AppEvent>)
         return;
     }
 
+    // Plan verification: if this is the first claim after a fresh batch of
+    // tasks was created (no tasks are InProgress yet, and multiple are Pending),
+    // first ask the model to verify the plan is sound before executing.
+    let counts = app.task_store.counts();
+    if counts.pending >= 3 && counts.in_progress == 0 && !app.plan_verified_this_batch {
+        app.plan_verified_this_batch = true;
+        let tasks = app.task_store.list_all();
+        let pending: Vec<_> = tasks
+            .iter()
+            .filter(|t| t.status == crate::tasks::TaskStatus::Pending)
+            .collect();
+        let task_list = pending
+            .iter()
+            .map(|t| {
+                let mut line = format!(
+                    "- {} (blocked_by: {:?}): {}",
+                    t.id, t.blocked_by, t.subject
+                );
+                if let Some(ref risk) = t.risk {
+                    line.push_str(&format!(" [risk: {risk:?}]"));
+                }
+                if let Some(ref ac) = t.acceptance_criteria {
+                    line.push_str(&format!(" | criteria: {ac}"));
+                }
+                if let Some(ref kind) = t.kind {
+                    line.push_str(&format!(" | kind: {kind:?}"));
+                }
+                line
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prompt = format!(
+            "Before executing the task queue, verify this plan is sound:\n\n{task_list}\n\n\
+             Check for: missing dependencies, circular deps, tasks that should be parallel but are serial, \
+             tasks that are too broad to complete in one agent turn, high-risk tasks that need user review, \
+             tasks missing acceptance criteria. \
+             If the plan is good, say 'Plan verified' and I'll start execution. \
+             If changes are needed, use TaskUpdate/TaskCreate/TaskDone to revise, then say 'Plan revised'."
+        );
+        let _ = tx.send(AppEvent::Submit(prompt)).await;
+        return;
+    }
+
     let Some(task) = app.task_store.claim_next_available("jfc-factory") else {
         return;
     };
-    let prompt = format!(
-        "Continue the task queue. Work on task `{}`: {}\n\n{}\n\nWhen this task is done, update its task status before stopping. If more unblocked tasks remain, continue with the next one.",
+
+    // Risk gating: high-risk tasks require explicit user approval.
+    if matches!(task.risk, Some(crate::tasks::TaskRisk::High)) {
+        // Unclaim the task and surface it for approval
+        let _ = app.task_store.update(
+            task.id.as_str(),
+            crate::tasks::TaskPatch {
+                status: Some(crate::tasks::TaskStatus::Pending),
+                owner: None,
+                ..Default::default()
+            },
+        );
+        tracing::info!(
+            target: "jfc::tasks::factory",
+            task_id = %task.id,
+            "high-risk task requires user approval — skipping auto-execution"
+        );
+        let prompt = format!(
+            "Task `{}` ('{}') is marked high-risk. Please review and approve before I execute it.\n\
+             Description: {}\n\
+             Acceptance criteria: {}",
+            task.id,
+            task.subject,
+            task.description,
+            task.acceptance_criteria.as_deref().unwrap_or("(none)")
+        );
+        let _ = tx.send(AppEvent::Submit(prompt)).await;
+        return;
+    }
+
+    let mut prompt = format!(
+        "Continue the task queue. Work on task `{}`: {}\n\n{}",
         task.id, task.subject, task.description
     );
+    if let Some(ref ac) = task.acceptance_criteria {
+        prompt.push_str(&format!("\n\nAcceptance criteria: {ac}"));
+    }
+    if let Some(ref vc) = task.verification_command {
+        prompt.push_str(&format!("\nVerification command: `{vc}`"));
+    }
+    prompt.push_str(&format!(
+        "\n\nWhen this task is done, update its task status before stopping. \
+         If you delegate this work via the Task tool, pass `parent_task_id: \"{}\"` \
+         so the runtime auto-marks the task in_progress/completed/failed as the \
+         subagent runs — no separate TaskUpdate/TaskDone needed. \
+         If more unblocked tasks remain, continue with the next one.",
+        task.id
+    ));
     tracing::info!(
         target: "jfc::tasks::factory",
         task_id = %task.id,
@@ -347,6 +457,7 @@ pub(crate) async fn run(
     oauth_handle: Option<Arc<crate::providers::AnthropicOAuthProvider>>,
     startup_session: super::StartupSession,
     initial_prompt: Option<String>,
+    initial_permission_mode: Option<crate::app::PermissionMode>,
 ) -> anyhow::Result<()> {
     // Bounded channel capacity for the main AppEvent loop. 1024 accommodates
     // typical streaming bursts (50-200 chunks) with headroom for concurrent tool
@@ -361,6 +472,18 @@ pub(crate) async fn run(
     tracing::info!(target: "jfc::ui::events", "registered AppEvent sender for non-Task agent paths");
     let mut app = App::new(provider, model);
     app.providers = providers.clone();
+    // v141 parity: when the caller passed `--permission-mode`, apply
+    // it before any user prompt so the first turn already runs under
+    // the requested mode. Without this the user would have to
+    // Shift+Tab inside the TUI on every boot.
+    if let Some(mode) = initial_permission_mode {
+        tracing::info!(
+            target: "jfc::ui",
+            ?mode,
+            "applying --permission-mode at startup"
+        );
+        app.permission_mode = mode;
+    }
     // Apply the user's persisted theme choice from
     // ~/.config/jfc/config.toml. Unknown / missing names fall back
     // silently to the default dark theme set by App::new.
@@ -464,6 +587,19 @@ pub(crate) async fn run(
                     app.current_session_id = Some(session_id.clone());
                     // Re-open task store so tasks from the resumed session are loaded.
                     app.task_store = crate::tasks::TaskStore::open(session_id.as_str());
+                    // Rebuild any active stop-condition from the goal
+                    // sidecar — without this, /continue forgets the
+                    // user's goal and the next EndTurn settles silently.
+                    if let Some(goal) = crate::goal::load_sidecar(session_id.as_str()) {
+                        tracing::info!(
+                            target: "jfc::goal",
+                            session_id = %session_id,
+                            condition = %goal.condition,
+                            iterations = goal.iterations,
+                            "restored goal from sidecar"
+                        );
+                        app.goal = Some(goal);
+                    }
                     if let Some(model_id) = saved_model {
                         if let Some(p) = super::provider_for_model(&app.providers, &model_id) {
                             tracing::info!(
@@ -529,6 +665,17 @@ pub(crate) async fn run(
                 app.current_session_id = Some(session_id.clone());
                 // Re-open task store so tasks from the resumed session are loaded.
                 app.task_store = crate::tasks::TaskStore::open(session_id.as_str());
+                // Rebuild any active stop-condition from the goal sidecar.
+                if let Some(goal) = crate::goal::load_sidecar(session_id.as_str()) {
+                    tracing::info!(
+                        target: "jfc::goal",
+                        session_id = %session_id,
+                        condition = %goal.condition,
+                        iterations = goal.iterations,
+                        "restored goal from sidecar"
+                    );
+                    app.goal = Some(goal);
+                }
                 if let Some(model_id) = saved_model {
                     if let Some(p) = super::provider_for_model(&app.providers, &model_id) {
                         tracing::info!(
@@ -801,15 +948,23 @@ pub(crate) async fn run(
                     // succeeds we attach it; otherwise fall through to
                     // the text path. Mirrors v126's clipboard-image flow.
                     let attached_image = match attachments::read_clipboard_image() {
-                        Ok(Some(att)) => {
+                        Ok(Some((att, w, h))) => {
                             toast::push_with_cap(
                                 &mut app.toasts,
                                 toast::Toast::new(
                                     toast::ToastKind::Info,
-                                    format!("📎 image attached ({} bytes)", att.bytes.len()),
+                                    format!("📎 image attached ({}x{}, {} bytes)", w, h, att.bytes.len()),
                                 ),
                             );
-                            app.pending_attachments.push(att);
+                            app.image_counter += 1;
+                            let id = app.image_counter;
+                            app.pasted_images.push(crate::attachments::PastedContent {
+                                id,
+                                attachment: att,
+                                width: w,
+                                height: h,
+                            });
+                            app.textarea.insert_str(&format!("[Image #{id}]"));
                             true
                         }
                         Ok(None) => false,
@@ -973,8 +1128,8 @@ pub(crate) async fn run(
                                             {
                                                 app.messages = messages;
                                                 app.switch_session(Some(id));
-                                                app.streaming_text.clear();
-                                                app.streaming_reasoning.clear();
+                                                app.streaming_text = String::new();
+                                                app.streaming_reasoning = String::new();
                                                 app.streaming_response_bytes = 0;
                                                 app.streaming_assistant_idx = None;
                                                 app.session_selected = idx;
@@ -1238,6 +1393,26 @@ pub(crate) async fn run(
                                 });
                             }
                         }
+                        TeammateEvent::Cancelled { task_id, agent_id } => {
+                            tracing::info!("[Swarm] Teammate {agent_id} cancelled");
+                            if let Some(bt) = app.background_tasks.get_mut(&task_id) {
+                                bt.status = crate::types::TaskLifecycle::Cancelled;
+                            }
+                            if let Some(team_name) = app.team_context.team_name.clone() {
+                                let member_name = agent_id
+                                    .split_once('@')
+                                    .map(|(n, _)| n.to_owned())
+                                    .unwrap_or_else(|| agent_id.clone());
+                                tokio::spawn(async move {
+                                    let _ = crate::swarm::team_helpers::set_member_active(
+                                        &team_name,
+                                        &member_name,
+                                        false,
+                                    )
+                                    .await;
+                                });
+                            }
+                        }
                         TeammateEvent::MessageSent {
                             from,
                             to,
@@ -1297,8 +1472,27 @@ pub(crate) async fn run(
                         .unwrap_or(true);
                     if detached_sync_due {
                         app.last_detached_sync_at = Some(std::time::Instant::now());
+                        // Detached workers (and in non-team mode, the
+                        // session task store) write task updates straight
+                        // to the JSON file from their own process. The UI's
+                        // TaskStore handle is loaded once and never re-reads
+                        // on its own — this mtime-gated reload picks up
+                        // those external TaskUpdate/TaskDone writes so the
+                        // todo panel reflects background-agent progress.
+                        if app.task_store.reload_if_changed() {
+                            needs_draw = true;
+                        }
                         if sync_detached_background_tasks_from_daemon(&mut app) {
                             needs_draw = true;
+                            // Re-evaluate the task factory after detached
+                            // agents transition. Without this,
+                            // maybe_continue_task_factory's
+                            // `background_tasks.any(is_alive)` gate blocks
+                            // the queue while agents run, but their later
+                            // completion (via daemon sync, not AppEvent)
+                            // never re-triggers the factory — the queue
+                            // stalls until the user sends another prompt.
+                            maybe_continue_task_factory(&mut app, &tx).await;
                         }
                     }
                     // Auto-clear expired toasts every tick. Cheap (O(N) over
@@ -1418,6 +1612,20 @@ pub(crate) async fn run(
                             "CLAUDE.md / agent / settings file changed since last \
                              turn. The reloaded content will be reflected in the \
                              next system prompt.",
+                        );
+                    }
+
+                    // Hot-reload keybindings when keybindings.toml changes.
+                    let cur_kb = crate::file_watcher::keybindings_change_counter();
+                    if cur_kb > app.last_keybindings_watcher_seen {
+                        app.last_keybindings_watcher_seen = cur_kb;
+                        crate::keybindings::load();
+                        toast::push_with_cap(
+                            &mut app.toasts,
+                            toast::Toast::new(
+                                toast::ToastKind::Info,
+                                "keybindings.toml reloaded",
+                            ),
                         );
                     }
 
@@ -1725,8 +1933,13 @@ pub(crate) async fn run(
                     // Tool input JSON streaming — accumulate bytes for the spinner's
                     // token estimate and reset the stall timer. Matches v126's
                     // accumulation of input_json_delta into responseLengthRef.
+                    // Also tick `last_stream_event_at` via `record_stream_activity`
+                    // so the watchdog doesn't false-trip during a long Task prompt
+                    // stream (the JSON for a 4-KB prompt arrives over many seconds
+                    // with no other StreamChunk events between).
                     app.streaming_response_bytes += byte_len;
                     app.streaming_last_token_at = Some(std::time::Instant::now());
+                    app.record_stream_activity();
                 }
                 AppEvent::StreamTool(tool) => {
                     app.record_stream_activity();
@@ -1744,10 +1957,56 @@ pub(crate) async fn run(
                         streaming_idx = ?app.streaming_assistant_idx,
                         "StreamTool received"
                     );
+                    // Guard 1: a tool that arrived already terminal (the stream
+                    // layer builds `ToolCall::new_failed` for malformed provider
+                    // input — bad JSON or schema mismatch) must NOT be dispatched.
+                    // Dispatching it routes a `kind`/`input` mismatch into
+                    // `execute_tool`, which falls through to the catch-all arm and
+                    // clobbers the original diagnostic with a misleading error.
+                    // Just record it in the transcript so the model sees the
+                    // tool_result it can react to.
+                    if tool.status.is_terminal() {
+                        tracing::info!(
+                            target: "jfc::ui::tool",
+                            tool_kind = tool.kind.label(),
+                            tool_id = %tool.id,
+                            status = tool.status.label(),
+                            "route=terminal_on_arrival (no dispatch)"
+                        );
+                        if let Some(idx) = app.streaming_assistant_idx {
+                            if let Some(msg) = app.messages.get_mut(idx) {
+                                msg.parts.push(MessagePart::Tool(tool));
+                            }
+                        }
+                    } else if let Some(reason) = app.tool_denied_by_mode(&tool) {
+                        // Guard 2: the active permission mode auto-denies this
+                        // tool (e.g. Plan mode blocking a Write, or an
+                        // UnknownTool in any mode). `tool_needs_approval` returns
+                        // false for `Denied`, so without this guard the tool
+                        // would fall into the no-approval auto-dispatch branch
+                        // and execute anyway. Mark it Failed with the denial
+                        // reason and record it instead.
+                        tracing::info!(
+                            target: "jfc::ui::tool",
+                            tool_kind = tool.kind.label(),
+                            tool_id = %tool.id,
+                            reason,
+                            "route=denied_by_mode (no dispatch)"
+                        );
+                        let mut tool = tool;
+                        let _ = tool.mark_failed();
+                        tool.output = ToolOutput::Text(format!(
+                            "Denied by permission mode: {reason}"
+                        ));
+                        if let Some(idx) = app.streaming_assistant_idx {
+                            if let Some(msg) = app.messages.get_mut(idx) {
+                                msg.parts.push(MessagePart::Tool(tool));
+                            }
+                        }
+                    } else if app.auto_mode.enabled {
                     // v126 auto-mode: when enabled, every tool call is sent to a
                     // classifier LLM that returns block/allow with a reason. The
                     // user is never prompted. Disabled (default) → original flow.
-                    if app.auto_mode.enabled {
                         tracing::info!(
                             target: "jfc::ui::tool",
                             tool_id = %tool.id,
@@ -2098,8 +2357,8 @@ pub(crate) async fn run(
                     if app.thinking_started_at.is_some() && app.thinking_ended_at.is_none() {
                         app.thinking_ended_at = Some(std::time::Instant::now());
                     }
-                    app.streaming_text.clear();
-                    app.streaming_reasoning.clear();
+                    app.streaming_text = String::new();
+                    app.streaming_reasoning = String::new();
                     // Only reset the cumulative token counter when the turn is
                     // truly done. During agentic loops (ToolUse stop_reason), the
                     // counter should keep accumulating so the spinner shows the
@@ -2111,12 +2370,114 @@ pub(crate) async fn run(
                     // genuinely concluded — EndTurn stop reason AND no
                     // tools pending. ToolUse means an agentic continuation
                     // is about to fire and the turn timer must keep running.
-                    if stop_reason == crate::provider::StopReason::EndTurn
+                    let turn_genuinely_done = stop_reason
+                        == crate::provider::StopReason::EndTurn
                         && app.pending_approval.is_none()
                         && app.approval_queue.is_empty()
-                        && app.pending_tool_calls.is_empty()
-                    {
+                        && app.pending_tool_calls.is_empty();
+                    if turn_genuinely_done {
                         app.turn_started_at = None;
+                    }
+
+                    // Faithfulness guard (formerly "hallucination guard"):
+                    // if the turn genuinely ended and the final assistant
+                    // message claims a side-effect happened, cross-check
+                    // against the tools that actually ran. The check
+                    // returns a three-state verdict (Backed / Ambiguous /
+                    // Unbacked) per arXiv:2605.10448's evidence-supported
+                    // bounds framing:
+                    //
+                    //   - Backed     → do nothing (the claim is fine)
+                    //   - Ambiguous  → toast + log, but DON'T re-run
+                    //                  (false-positive risk too high to
+                    //                  cost a turn)
+                    //   - Unbacked   → inject system-reminder + re-run
+                    //
+                    // Disabled entirely via JFC_DISABLE_HALLUCINATION_GUARD.
+                    // Detection-only (no re-run, just toast/log) via
+                    // JFC_HALLUCINATION_GUARD_LOG_ONLY — useful for
+                    // tuning the pattern set against real workloads
+                    // without disrupting the user.
+                    let guard_disabled = matches!(
+                        std::env::var("JFC_DISABLE_HALLUCINATION_GUARD").as_deref(),
+                        Ok("1") | Ok("true")
+                    );
+                    if turn_genuinely_done && !guard_disabled {
+                        let verdict = app
+                            .streaming_assistant_idx
+                            .and_then(|idx| app.messages.get(idx))
+                            .map(crate::hallucination_guard::evaluate);
+                        match verdict {
+                            Some(crate::hallucination_guard::FaithfulnessVerdict::Ambiguous {
+                                phrase,
+                                category,
+                                reason,
+                            }) => {
+                                tracing::info!(
+                                    target: "jfc::hallucination",
+                                    matched_phrase = phrase,
+                                    ?category,
+                                    reason,
+                                    "assistant claim is ambiguous (related tool or negative qualifier present) — logging only"
+                                );
+                                crate::toast::push_with_cap(
+                                    &mut app.toasts,
+                                    crate::toast::Toast::new(
+                                        crate::toast::ToastKind::Info,
+                                        format!(
+                                            "Claim ambiguity ({phrase:?}): {reason}"
+                                        ),
+                                    ),
+                                );
+                            }
+                            Some(crate::hallucination_guard::FaithfulnessVerdict::Unbacked {
+                                phrase,
+                                category,
+                            }) => {
+                                tracing::warn!(
+                                    target: "jfc::hallucination",
+                                    matched_phrase = phrase,
+                                    ?category,
+                                    "assistant claimed a side-effect without a backing tool call"
+                                );
+                                if crate::hallucination_guard::log_only_mode() {
+                                    crate::toast::push_with_cap(
+                                        &mut app.toasts,
+                                        crate::toast::Toast::new(
+                                            crate::toast::ToastKind::Warning,
+                                            format!(
+                                                "[log-only] Unbacked claim ({phrase:?}) — would have re-run"
+                                            ),
+                                        ),
+                                    );
+                                } else {
+                                    crate::toast::push_with_cap(
+                                        &mut app.toasts,
+                                        crate::toast::Toast::new(
+                                            crate::toast::ToastKind::Warning,
+                                            format!(
+                                                "Unbacked claim ({phrase:?}) — asking the model to redo with a real tool call"
+                                            ),
+                                        ),
+                                    );
+                                    crate::system_reminder::append_to_last_user(
+                                        &mut app.messages,
+                                        &format!(
+                                            "Your previous response claimed `{phrase}` but emitted no \
+                                             matching tool call — the file/command/action was NOT \
+                                             actually executed. Either issue the correct \
+                                             Write/Edit/Bash/etc. tool call THIS turn, or explicitly \
+                                             retract the claim and say what's blocking you."
+                                        ),
+                                    );
+                                    stream::continue_agentic_loop(&mut app, &tx).await;
+                                    continue;
+                                }
+                            }
+                            _ => {
+                                // Backed or non-assistant message — no action.
+                            }
+                        }
                     }
 
                     // Auto-save session after each assistant turn completes
@@ -2146,68 +2507,88 @@ pub(crate) async fn run(
                     {
                         drain_queued_prompts(&mut app, &tx).await;
                     }
-                    if stop_reason == crate::provider::StopReason::ToolUse {
-                        if !app.pending_tool_calls.is_empty() {
-                            let calls = std::mem::take(&mut app.pending_tool_calls);
-                            tracing::info!(
-                                target: "jfc::stream",
-                                n = calls.len(),
-                                kinds = ?calls.iter().map(|t| t.kind.label()).collect::<Vec<_>>(),
-                                "stream_done dispatching auto-routed batch"
-                            );
-                            update_task_activities(&mut app, &calls);
-                            stream::dispatch_tools_batched(
-                                calls,
-                                &tx,
-                                std::sync::Arc::clone(&app.dedup_cache),
-                                Some(std::sync::Arc::clone(&app.task_store)),
-                                app.team_context.team_name.clone(),
-                                app.current_session_id
-                                    .as_ref()
-                                    .map(|id| id.as_str().to_owned()),
-                                std::sync::Arc::clone(&app.provider),
-                                app.model.clone(),
-                                app.teammate_event_tx.clone(),
-                                app.cancel_token.clone(),
-                            );
-                        } else if app.pending_approval.is_some() || !app.approval_queue.is_empty() {
-                            tracing::info!(
-                                target: "jfc::stream",
-                                pending_modal = app.pending_approval.is_some(),
-                                queue_depth = app.approval_queue.len(),
-                                "stream_done waiting on approval pipeline"
-                            );
-                            // Tool awaiting user approval — keep streaming_assistant_idx
-                            // alive so the approved/denied tool can be inserted into the
-                            // correct message. AllToolsComplete fires after approval.
-                        } else {
-                            // Upstream returned finish_reason="tool_calls" but sent
-                            // zero tool_call delta chunks (transient LiteLLM/Bedrock
-                            // failure). The assistant message that was pre-pushed to
-                            // history is empty and un-replyable; strip it so the
-                            // next user turn doesn't send a broken conversation turn.
-                            tracing::warn!(
-                                target: "jfc::stream",
-                                streaming_idx = ?app.streaming_assistant_idx,
-                                "stream_done ToolUse with no tools — stripping dangling assistant turn"
-                            );
-                            if let Some(idx) = app.streaming_assistant_idx {
-                                if idx < app.messages.len() {
-                                    let msg = &app.messages[idx];
-                                    let is_empty = msg.parts.is_empty()
+                    // Dispatch any tools that were emitted during streaming,
+                    // regardless of `stop_reason`. Some providers (OpenWebUI,
+                    // LiteLLM, Bedrock proxies, even Anthropic on transient
+                    // fast-paths) return `finish_reason="stop"` while the
+                    // assistant message actually contains tool_use blocks.
+                    // Mirrors OpenCode's `prompt.ts:1382` workaround: "Some
+                    // providers return stop even when the assistant message
+                    // contains tool calls" — keep the loop alive if tools
+                    // exist. Previously the `else` branch below cleared
+                    // pending_tool_calls when stop_reason != ToolUse,
+                    // silently dropping the user's requested tools and
+                    // leaving the model's "I'll write the file now" claim
+                    // unbacked — the "hallucinated Done" symptom.
+                    let has_pending_tools = !app.pending_tool_calls.is_empty();
+                    let waiting_on_approval =
+                        app.pending_approval.is_some() || !app.approval_queue.is_empty();
+                    if has_pending_tools {
+                        let calls = std::mem::take(&mut app.pending_tool_calls);
+                        tracing::info!(
+                            target: "jfc::stream",
+                            n = calls.len(),
+                            ?stop_reason,
+                            kinds = ?calls.iter().map(|t| t.kind.label()).collect::<Vec<_>>(),
+                            "stream_done dispatching auto-routed batch"
+                        );
+                        update_task_activities(&mut app, &calls);
+                        stream::dispatch_tools_batched(
+                            calls,
+                            &tx,
+                            std::sync::Arc::clone(&app.dedup_cache),
+                            Some(std::sync::Arc::clone(&app.task_store)),
+                            app.team_context.team_name.clone(),
+                            app.current_session_id
+                                .as_ref()
+                                .map(|id| id.as_str().to_owned()),
+                            std::sync::Arc::clone(&app.provider),
+                            app.model.clone(),
+                            app.teammate_event_tx.clone(),
+                            app.cancel_token.clone(),
+                        );
+                    } else if waiting_on_approval {
+                        tracing::info!(
+                            target: "jfc::stream",
+                            pending_modal = app.pending_approval.is_some(),
+                            queue_depth = app.approval_queue.len(),
+                            ?stop_reason,
+                            "stream_done waiting on approval pipeline"
+                        );
+                        // Tool awaiting user approval — keep streaming_assistant_idx
+                        // alive so the approved/denied tool can be inserted into the
+                        // correct message. AllToolsComplete fires after approval.
+                    } else if stop_reason == crate::provider::StopReason::ToolUse {
+                        // Upstream returned finish_reason="tool_calls" but sent
+                        // zero tool_call delta chunks (transient LiteLLM/Bedrock
+                        // failure). The assistant message that was pre-pushed to
+                        // history is empty and un-replyable; strip it so the
+                        // next user turn doesn't send a broken conversation turn.
+                        tracing::warn!(
+                            target: "jfc::stream",
+                            streaming_idx = ?app.streaming_assistant_idx,
+                            "stream_done ToolUse with no tools — stripping dangling assistant turn"
+                        );
+                        if let Some(idx) = app.streaming_assistant_idx {
+                            if idx < app.messages.len() {
+                                let msg = &app.messages[idx];
+                                let is_empty = msg.parts.is_empty()
                                     || msg.parts.iter().all(|p| {
                                         matches!(p, MessagePart::Text(t) if t.trim().is_empty())
                                     });
-                                    if is_empty {
-                                        app.messages.remove(idx);
-                                    }
+                                if is_empty {
+                                    app.messages.remove(idx);
                                 }
                             }
-                            app.streaming_assistant_idx = None;
-                            app.scroll_to_bottom();
                         }
+                        app.streaming_assistant_idx = None;
+                        app.scroll_to_bottom();
                     } else {
-                        app.pending_tool_calls.clear();
+                        // Normal EndTurn with no tools — turn is genuinely
+                        // complete. Don't clear pending_tool_calls here;
+                        // the `has_pending_tools` branch above already
+                        // would have taken them. This branch is just the
+                        // "model said its piece and stopped" path.
                         app.streaming_assistant_idx = None;
                         app.scroll_to_bottom();
                     }
@@ -2219,6 +2600,56 @@ pub(crate) async fn run(
                         error = %e,
                         "AppEvent::StreamError — resetting stream state"
                     );
+
+                    // ─── Synthetic tool_result injection on interrupt ────────
+                    // When a stream is interrupted with pending/running tool_use
+                    // entries in the conversation, inject a user-message with
+                    // tool_result is_error=true for each dangling tool_use.
+                    // Without this, the next API call fails because Anthropic's
+                    // API requires every tool_use to have a matching tool_result.
+                    // Mirrors claude-code 2.1.141's createSyntheticErrorMessage.
+                    if e.contains("Interrupted by user") {
+                        if let Some(assistant_idx) = app.streaming_assistant_idx {
+                            if let Some(msg) = app.messages.get(assistant_idx) {
+                                let dangling_tool_ids: Vec<crate::ids::ToolId> = msg
+                                    .parts
+                                    .iter()
+                                    .filter_map(|p| {
+                                        if let types::MessagePart::Tool(tc) = p {
+                                            if matches!(
+                                                tc.status,
+                                                types::ToolStatus::Pending | types::ToolStatus::Running
+                                            ) {
+                                                return Some(tc.id.clone());
+                                            }
+                                        }
+                                        None
+                                    })
+                                    .collect();
+                                if !dangling_tool_ids.is_empty() {
+                                    tracing::info!(
+                                        target: "jfc::stream",
+                                        count = dangling_tool_ids.len(),
+                                        "injecting synthetic tool_result for interrupted tool_use(s)"
+                                    );
+                                    // Mark each tool as Failed in the assistant message.
+                                    if let Some(msg) = app.messages.get_mut(assistant_idx) {
+                                        for part in &mut msg.parts {
+                                            if let types::MessagePart::Tool(tc) = part {
+                                                if dangling_tool_ids.contains(&tc.id) {
+                                                    tc.status = types::ToolStatus::Failed;
+                                                    tc.output = types::ToolOutput::Text(
+                                                        "[Request interrupted by user]".to_owned(),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // ─── End synthetic tool_result injection ─────────────────
                     let auto_retry_openwebui_signal =
                         e.starts_with(crate::providers::openwebui::AUTO_RETRY_SENTINEL);
                     let auto_retry_anthropic_oauth_signal =
@@ -2270,8 +2701,8 @@ pub(crate) async fn run(
                     app.streaming_last_token_at = None;
                     app.thinking_started_at = None;
                     app.thinking_ended_at = None;
-                    app.streaming_text.clear();
-                    app.streaming_reasoning.clear();
+                    app.streaming_text = String::new();
+                    app.streaming_reasoning = String::new();
                     app.render_cache.borrow_mut().clear_streaming();
                     app.streaming_response_bytes = 0;
                     app.streaming_assistant_idx = None;
@@ -2546,21 +2977,86 @@ pub(crate) async fn run(
                                             std::time::Instant::now(),
                                         ));
                                     }
+                                    // Reset plan verification when new tasks are
+                                    // created so the next factory cycle re-verifies.
+                                    if matches!(tc.kind, ToolKind::TaskCreate)
+                                        && matches!(new_status, ToolStatus::Completed)
+                                    {
+                                        app.plan_verified_this_batch = false;
+                                    }
                                     found = true;
                                     break;
                                 }
                             }
                         }
                         if found {
+                            // If the tool result carries attachments (e.g. a
+                            // PDF loaded by the Read tool), push them onto the
+                            // assistant message that owns the tool call. They'll
+                            // be serialized as ProviderContent::Attachment blocks
+                            // in the next provider request via per-message
+                            // ownership — no global queue needed.
+                            if !result.attachments.is_empty() {
+                                for msg in &mut app.messages {
+                                    if matches!(msg.role, types::Role::Assistant)
+                                        && msg.parts.iter().any(|p| {
+                                            matches!(p, MessagePart::Tool(tc) if tc.id == tool_id)
+                                        })
+                                    {
+                                        tracing::debug!(
+                                            target: "jfc::stream",
+                                            tool_id = %tool_id,
+                                            count = result.attachments.len(),
+                                            "promoting tool result attachments to owning message"
+                                        );
+                                        msg.attachments.extend(result.attachments.clone());
+                                        break;
+                                    }
+                                }
+                            }
                             break;
                         }
                     }
-                    // Persist on every ToolResult so reload reflects tool outputs.
-                    // Without this, sessions saved at submit time carry empty
-                    // assistant placeholders + Pending tools — replaying them
-                    // shows a user prompt with nothing under it. v126 cli.js
-                    // saves on every state mutation; jfc previously only saved
-                    // at submit + StreamDone, missing the post-tool state.
+                    // Session save is deferred to AllToolsComplete so we write
+                    // once per batch, not once per tool result. This eliminates
+                    // the 650+ disk writes per agentic run observed in profiling.
+                }
+                AppEvent::AllToolsComplete => {
+                    tracing::info!(
+                        target: "jfc::stream",
+                        message_count = app.messages.len(),
+                        model = %app.model,
+                        pending_approvals = app.approval_queue.len() + usize::from(app.pending_approval.is_some()),
+                        pending_tool_calls = app.pending_tool_calls.len(),
+                        "AppEvent::AllToolsComplete"
+                    );
+                    // AllToolsComplete is *batch-local*: it fires when
+                    // the current `dispatch_tools_batched` call finishes
+                    // its tools. The approval path dispatches one tool at
+                    // a time, so this event arrives once per approval —
+                    // not once per turn. Treat the event as authoritative
+                    // for "the local batch ended" only; defer turn-level
+                    // side effects (compaction, queued-prompt drain,
+                    // agentic continuation) until ALL of the following
+                    // are true:
+                    //   - no tool waiting on user approval
+                    //   - no other tools queued for approval
+                    //   - no pending in-flight tool_calls
+                    // Otherwise we'd kick off compaction mid-turn (while
+                    // half the model's tool batch is still queued) and
+                    // re-stream provider requests against an incomplete
+                    // transcript.
+                    let turn_truly_complete = app.pending_approval.is_none()
+                        && app.approval_queue.is_empty()
+                        && app.pending_tool_calls.is_empty();
+                    if !turn_truly_complete {
+                        tracing::debug!(
+                            target: "jfc::stream",
+                            "AllToolsComplete: batch finished but turn still has pending tools — deferring side effects"
+                        );
+                        continue;
+                    }
+                    // Save session once per completed tool batch (not per tool).
                     if let Some(ref session_id) = app.current_session_id {
                         let sid = session_id.clone();
                         let msgs = app.messages.clone();
@@ -2575,15 +3071,47 @@ pub(crate) async fn run(
                             )
                             .await;
                         });
+                        app.last_session_save_at = Some(std::time::Instant::now());
                     }
-                }
-                AppEvent::AllToolsComplete => {
-                    tracing::info!(
-                        target: "jfc::stream",
-                        message_count = app.messages.len(),
-                        model = %app.model,
-                        "AppEvent::AllToolsComplete"
-                    );
+
+                    // Slop Guard aggregation: scan the last assistant
+                    // message's tool results for slop_guard findings.
+                    // If any are present, inject a system-reminder so
+                    // the model sees the aggregate findings on its next turn.
+                    {
+                        let marker = crate::tools::SLOP_GUARD_MARKER;
+                        let mut aggregate_findings: Vec<String> = Vec::new();
+                        if let Some(last_assistant) = app.messages.iter().rev().find(|m| m.role == Role::Assistant) {
+                            for part in &last_assistant.parts {
+                                if let MessagePart::Tool(tc) = part {
+                                    let output_text = tc.output.to_api_text();
+                                    if let Some(idx) = output_text.find(marker) {
+                                        let findings = &output_text[idx + marker.len()..];
+                                        if !findings.trim().is_empty() {
+                                            aggregate_findings.push(findings.trim().to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if !aggregate_findings.is_empty() {
+                            let reminder_body = format!(
+                                "Slop Guard detected quality issues in your recent edits. \
+                                 Review and fix these before proceeding:\n\n{}",
+                                aggregate_findings.join("\n\n---\n\n")
+                            );
+                            tracing::debug!(
+                                target: "jfc::slop_guard",
+                                finding_count = aggregate_findings.len(),
+                                "injecting slop_guard system-reminder"
+                            );
+                            crate::system_reminder::append_to_last_user(
+                                &mut app.messages,
+                                &reminder_body,
+                            );
+                        }
+                    }
+
                     // Terminal bell when a tool batch completes — matches
                     // v126's `iterm2_with_bell` / `terminal_bell` behavior
                     // (cli.js:46704). Many users have iTerm2 / WezTerm /
@@ -2673,10 +3201,17 @@ pub(crate) async fn run(
                         // sending CompactionDone into a stale state.
                         let cancel_compact = app.cancel_token.clone();
                         tokio::spawn(async move {
-                            let options = crate::provider::StreamOptions::new(model.clone());
+                            // Use compaction_model from config if set; otherwise
+                            // fall back to the session's current model.
+                            let compact_model_id = crate::config::load()
+                                .default
+                                .compaction_model
+                                .map(|m| crate::provider::ModelId::new(m))
+                                .unwrap_or_else(|| model.clone());
+                            let options = crate::provider::StreamOptions::new(compact_model_id.clone());
                             tracing::debug!(
                                 target: "jfc::compact",
-                                model = %model,
+                                model = %compact_model_id,
                                 window,
                                 "spawned post-response compaction task"
                             );
@@ -2820,6 +3355,40 @@ pub(crate) async fn run(
                         && app.compacting_started_at.is_none()
                         && stream::should_continue_loop(&app.messages)
                     {
+                        // Fan-out consolidation: if multiple parallel agent
+                        // tasks completed in this batch, inject a summary
+                        // so the model sees a coherent digest before responding.
+                        if let Some(last_assistant) = app.messages.iter().rev().find(|m| m.role == Role::Assistant) {
+                            let task_summaries: Vec<String> = last_assistant
+                                .parts
+                                .iter()
+                                .filter_map(|p| {
+                                    if let MessagePart::TaskStatus(ts) = p {
+                                        if ts.status.is_terminal() {
+                                            return ts.summary.clone().or_else(|| ts.error.clone());
+                                        }
+                                    }
+                                    None
+                                })
+                                .collect();
+                            if task_summaries.len() >= 2 {
+                                let task_count = task_summaries.len();
+                                let consolidated = format!(
+                                    "{task_count} parallel agents completed this batch. Their results:\n\n{}",
+                                    task_summaries
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, s)| format!("{}. {}", i + 1, s.chars().take(200).collect::<String>()))
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                );
+                                crate::system_reminder::append_to_last_user(
+                                    &mut app.messages,
+                                    &format!("Consolidation of {task_count} parallel agent results:\n\n{consolidated}\n\nSynthesize these results into a coherent response. Deduplicate overlapping findings. Note any contradictions between agents."),
+                                );
+                            }
+                        }
+
                         tracing::info!(
                             target: "jfc::stream",
                             "agentic loop continuing — tools complete, no pending approvals"
@@ -2839,9 +3408,26 @@ pub(crate) async fn run(
                         // so the spinner stops, then drain any prompts the user
                         // typed during streaming.
                         app.turn_started_at = None;
-                        drain_queued_prompts(&mut app, &tx).await;
-                        maybe_continue_task_factory(&mut app, &tx).await;
+                        // /goal stop-hook: if a goal is active, the agent
+                        // doesn't truly get to stop here. Fire the
+                        // evaluator in the background; the agentic loop
+                        // re-enters when the verdict lands (see
+                        // AppEvent::GoalVerdict). Bail before draining
+                        // queued prompts so a queued prompt can't race
+                        // ahead of the verdict and unset the goal mid-eval.
+                        if dispatch_goal_evaluator_if_active(&mut app, &tx) {
+                            tracing::info!(
+                                target: "jfc::goal",
+                                "goal evaluator dispatched on EndTurn — deferring drain"
+                            );
+                        } else {
+                            drain_queued_prompts(&mut app, &tx).await;
+                            maybe_continue_task_factory(&mut app, &tx).await;
+                        }
                     }
+                }
+                AppEvent::GoalVerdict { ok, reason } => {
+                    handle_goal_verdict(&mut app, &tx, ok, reason).await;
                 }
                 AppEvent::CompactionStarted => {
                     // The compacting_started_at guard is now set synchronously
@@ -2890,7 +3476,8 @@ pub(crate) async fn run(
                         new_message_count = messages.len(),
                         "applying compaction result to app state"
                     );
-                    if app.is_streaming {
+                    let was_streaming = app.is_streaming;
+                    if was_streaming {
                         // Defensive: should be unreachable with the synchronous
                         // compacting_started_at guard, but if a stream somehow
                         // started during compaction, don't clobber live state.
@@ -2901,9 +3488,47 @@ pub(crate) async fn run(
                         );
                     } else {
                         app.messages = messages;
+                        // Migrate cleanup flags (rapid_refill_count,
+                        // last_compact_turn, etc.) from the compact
+                        // worker's local tool_ctx, but preserve the
+                        // calibrated `approx_tokens` already on app —
+                        // either the wire-reported value from the most
+                        // recent `StreamUsage` or the resume-time anchor
+                        // from `recompute_token_estimate`. Overwriting
+                        // with the post-compaction chars-based estimate
+                        // (`post_tokens`) created a down-then-up flicker:
+                        // gauge would drop to the local estimate (e.g.
+                        // 60k) and then the next stream's first
+                        // `StreamUsage` would snap it back to the
+                        // wire-truth (e.g. 500k, dominated by cache_read
+                        // of the still-cached system prompt + tool defs).
+                        // Recompute from messages so the visible value
+                        // reflects what's actually about to be sent on
+                        // the next turn — both compaction and the
+                        // pre-submit gate now use the same source.
+                        let preserved = app.tool_ctx.approx_tokens;
                         app.tool_ctx = tool_ctx;
-                        app.tool_ctx.approx_tokens = post_tokens;
+                        // Use the smaller of (preserved calibrated value)
+                        // and post_tokens — preserved is wire-truth from
+                        // before compact, post_tokens is a local
+                        // estimate. After compaction the real prompt is
+                        // ≤ pre-compact; clamping to min protects against
+                        // showing the user a count larger than reality.
+                        app.tool_ctx.approx_tokens = preserved.min(post_tokens);
+                        // Add a fixed overhead estimate for system prompt, tool defs,
+                        // memories, etc. that the local message estimate doesn't include.
+                        // Without this, the gauge shows "safe" immediately post-compact
+                        // while the next request actually sends system+messages which can
+                        // be 50-100k+ of overhead.
+                        let overhead = app.last_system_prompt_len.unwrap_or(30_000);
+                        app.tool_ctx.approx_tokens = app.tool_ctx.approx_tokens.saturating_add(overhead);
                         app.last_usage_input = 0;
+                        // Reset the per-turn baseline so the next
+                        // `StreamUsage` cumulative delta builds from 0,
+                        // not from pre-compact totals — without this,
+                        // `apply_cumulative` would treat the post-compact
+                        // input as a negative delta and stall.
+                        app.usage_apply_baseline = (0, 0, 0, 0);
                     }
                     app.compacting_started_at = None;
                     app.compacting_output_chars = 0;
@@ -2920,6 +3545,42 @@ pub(crate) async fn run(
                             format!("Compacted — saved ~{saved_k}k tokens"),
                         ),
                     );
+                    // Resume any deferred agentic continuation. When
+                    // compaction was triggered from `AllToolsComplete`,
+                    // that handler's continuation check skipped because
+                    // `compacting_started_at.is_some()`. Without this
+                    // resume the user's tool result never feeds back into
+                    // the model — the turn silently dies right after the
+                    // "Compacted" toast and queued prompts back up while
+                    // the spinner hangs. Mirror AllToolsComplete's gate:
+                    // continue only if the transcript ends on
+                    // tool_results (should_continue_loop=true) and
+                    // there's no other reason to pause.
+                    if !was_streaming
+                        && app.pending_approval.is_none()
+                        && app.approval_queue.is_empty()
+                        && app.pending_tool_calls.is_empty()
+                        && !app.interrupt_flag.load(std::sync::atomic::Ordering::SeqCst)
+                        && !app.cancel_token.is_cancelled()
+                        && stream::should_continue_loop(&app.messages)
+                    {
+                        tracing::info!(
+                            target: "jfc::stream",
+                            "agentic loop resuming after CompactionDone — tool results pending"
+                        );
+                        stream::continue_agentic_loop(&mut app, &tx).await;
+                    } else if !was_streaming
+                        && app.pending_approval.is_none()
+                        && app.approval_queue.is_empty()
+                        && app.pending_tool_calls.is_empty()
+                    {
+                        // Compaction landed at end of turn (no pending
+                        // tool results). Drain queued prompts so they
+                        // start now that the context is clean.
+                        app.turn_started_at = None;
+                        drain_queued_prompts(&mut app, &tx).await;
+                        maybe_continue_task_factory(&mut app, &tx).await;
+                    }
                 }
                 AppEvent::CompactionFailed(reason, calibrated_tokens, transient) => {
                     tracing::warn!(
@@ -2994,6 +3655,9 @@ pub(crate) async fn run(
                         "AppEvent::Submit (re-queued after compaction)"
                     );
                     input::handle_submit_text(&mut app, text, &tx).await?;
+                }
+                AppEvent::SystemPromptLen(len) => {
+                    app.last_system_prompt_len = Some(len);
                 }
                 AppEvent::Toast { kind, text } => {
                     // Push onto the auto-expiring strip with the kind's
@@ -3080,8 +3744,27 @@ pub(crate) async fn run(
                             if let Some(last) = bt.messages.last_mut() {
                                 last.push_str(&text);
                             }
+                            // Also coalesce into the structured chat_messages.
+                            let chat_coalesce = bt
+                                .chat_messages
+                                .last()
+                                .map(|m| m.role == types::Role::Assistant)
+                                .unwrap_or(false);
+                            if chat_coalesce {
+                                if let Some(msg) = bt.chat_messages.last_mut() {
+                                    if let Some(types::MessagePart::Text(t)) = msg.parts.last_mut() {
+                                        t.push_str(&text);
+                                    } else {
+                                        msg.parts.push(types::MessagePart::Text(text));
+                                    }
+                                }
+                            } else {
+                                bt.chat_messages.push(types::ChatMessage::assistant(text));
+                            }
                         } else {
-                            bt.messages.push(text);
+                            bt.messages.push(text.clone());
+                            // Start a new assistant message in the structured log.
+                            bt.chat_messages.push(types::ChatMessage::assistant(text));
                         }
                     }
                 }
@@ -3113,13 +3796,35 @@ pub(crate) async fn run(
                     description,
                     model_used,
                     max_input_tokens,
+                    is_detached,
+                    parent_task_id,
                 } => {
                     tracing::info!(
                         target: "jfc::task",
-                        %task_id, %description, ?model_used,
+                        %task_id, %description, ?model_used, is_detached,
+                        ?parent_task_id,
                         "TaskStarted"
                     );
                     use types::{TaskLifecycle, TaskStatusPart};
+                    // If this delegation is linked to a queued todo, flip
+                    // that todo to InProgress now so the task panel reflects
+                    // that an agent has picked it up.
+                    if let Some(ref ptid) = parent_task_id {
+                        if let Err(e) = app.task_store.update(
+                            ptid,
+                            crate::tasks::TaskPatch {
+                                status: Some(crate::tasks::TaskStatus::InProgress),
+                                ..Default::default()
+                            },
+                        ) {
+                            tracing::warn!(
+                                target: "jfc::task",
+                                parent_task_id = %ptid,
+                                error = %e,
+                                "TaskStarted: failed to mark linked task in_progress"
+                            );
+                        }
+                    }
                     app.background_tasks.insert(
                         task_id.as_str().to_owned(),
                         app::BackgroundTask {
@@ -3131,6 +3836,7 @@ pub(crate) async fn run(
                             error: None,
                             last_tool: None,
                             messages: Vec::new(),
+                            chat_messages: Vec::new(),
                             tool_use_count: 0,
                             latest_input_tokens: 0,
                             latest_cache_read_tokens: 0,
@@ -3141,14 +3847,31 @@ pub(crate) async fn run(
                                 .or_else(|| Some(app.model.as_str().to_owned())),
                             max_input_tokens,
                             budget_killed: false,
+                            parent_task_id: parent_task_id.clone(),
                         },
                     );
-                    crate::daemon::record_background_agent_started(
-                        task_id.as_str(),
-                        &description,
-                        model_used.or_else(|| Some(app.model.as_str().to_owned())),
-                        None,
-                    );
+                    // Only register detached workers into the daemon
+                    // roster. For detached agents the worker process
+                    // already wrote pid + launch_path via
+                    // `record_background_agent_started_at`; we still call
+                    // the registry here so the UI-side launch metadata
+                    // (description / model) refreshes, but the PID-write
+                    // contract in `record_background_agent_started_at`
+                    // prevents the UI's own PID from clobbering the
+                    // worker's. Foreground teammates / in-process
+                    // subagents are tracked exclusively via
+                    // `app.background_tasks` — registering them in the
+                    // daemon would make the reconciler mark them stale
+                    // when the UI exits (the user-visible "Done" /
+                    // "Failed" labels in the screenshots).
+                    if is_detached {
+                        crate::daemon::record_background_agent_started(
+                            task_id.as_str(),
+                            &description,
+                            model_used.or_else(|| Some(app.model.as_str().to_owned())),
+                            None,
+                        );
+                    }
                     let part = MessagePart::TaskStatus(TaskStatusPart {
                         task_id,
                         description,
@@ -3178,15 +3901,13 @@ pub(crate) async fn run(
                     let mut usage_update: Option<(String, u32, u32, u32, u32)> = None;
                     if let Some(bt) = app.background_tasks.get_mut(task_id.as_str()) {
                         if let Some(ref tool) = last_tool {
-                            // Append a one-line activity entry to the task's
-                            // message log so `messages_task_view` shows what
-                            // the agent has done. Without this the task view
-                            // renders "No messages yet" for the entire run.
-                            // Full subagent StreamChunk routing is a bigger
-                            // refactor; this is the minimum that makes the
-                            // task view useful right now.
                             let elapsed_s = elapsed_ms / 1000;
-                            bt.messages.push(format!("[{elapsed_s}s] {tool}"));
+                            let entry = format!("[{elapsed_s}s] {tool}");
+                            bt.messages.push(entry.clone());
+                            // Push a muted user-role note into the structured log
+                            // so the MessageView renderer can show tool activity
+                            // inline with the assistant's text output.
+                            bt.chat_messages.push(types::ChatMessage::user(entry));
                         }
                         bt.last_tool = last_tool.clone();
                         if let Some(n) = tool_use_count {
@@ -3262,12 +3983,37 @@ pub(crate) async fn run(
                         "TaskCompleted"
                     );
                     use types::TaskLifecycle;
+                    let mut linked_task_id: Option<String> = None;
                     if let Some(bt) = app.background_tasks.get_mut(task_id.as_str()) {
                         bt.status = TaskLifecycle::Completed;
                         bt.summary = Some(summary.clone());
                         let elapsed_s = elapsed_ms / 1000;
-                        bt.messages
-                            .push(format!("[{elapsed_s}s] ✓ done — {summary}"));
+                        let entry = format!("[{elapsed_s}s] ✓ done — {summary}");
+                        bt.messages.push(entry.clone());
+                        bt.chat_messages.push(types::ChatMessage::assistant(entry));
+                        linked_task_id = bt.parent_task_id.clone();
+                    }
+                    // If the model linked this delegation to a queued todo
+                    // via `parent_task_id`, mark that todo Completed in the
+                    // TaskStore. Without this, a foreground subagent could
+                    // finish cleanly while its queued task stayed
+                    // `in_progress` — the Task tool result and the
+                    // persistent todo were never connected.
+                    if let Some(ref ptid) = linked_task_id {
+                        if let Err(e) = app.task_store.update(
+                            ptid,
+                            crate::tasks::TaskPatch {
+                                status: Some(crate::tasks::TaskStatus::Completed),
+                                ..Default::default()
+                            },
+                        ) {
+                            tracing::warn!(
+                                target: "jfc::task",
+                                parent_task_id = %ptid,
+                                error = %e,
+                                "TaskCompleted: failed to mark linked task completed"
+                            );
+                        }
                     }
                     crate::daemon::record_background_agent_finished(
                         task_id.as_str(),
@@ -3298,6 +4044,7 @@ pub(crate) async fn run(
                         .trim_start()
                         .to_ascii_lowercase()
                         .starts_with("cancelled:");
+                    let mut linked_task_id: Option<String> = None;
                     if let Some(bt) = app.background_tasks.get_mut(task_id.as_str()) {
                         bt.status = if was_cancelled {
                             TaskLifecycle::Cancelled
@@ -3305,6 +4052,36 @@ pub(crate) async fn run(
                             TaskLifecycle::Failed
                         };
                         bt.error = Some(error.clone());
+                        let prefix = if was_cancelled { "cancelled" } else { "failed" };
+                        let entry = format!("[{prefix}] {error}");
+                        bt.messages.push(entry.clone());
+                        bt.chat_messages.push(types::ChatMessage::assistant(entry));
+                        linked_task_id = bt.parent_task_id.clone();
+                    }
+                    // Propagate the failure to the linked queued todo. A
+                    // cancelled agent leaves the task Pending (so the queue
+                    // can retry it); a genuine failure marks it Failed so
+                    // the cascade / replan logic below can react.
+                    if let Some(ref ptid) = linked_task_id {
+                        let next_status = if was_cancelled {
+                            crate::tasks::TaskStatus::Pending
+                        } else {
+                            crate::tasks::TaskStatus::Failed
+                        };
+                        if let Err(e) = app.task_store.update(
+                            ptid,
+                            crate::tasks::TaskPatch {
+                                status: Some(next_status),
+                                ..Default::default()
+                            },
+                        ) {
+                            tracing::warn!(
+                                target: "jfc::task",
+                                parent_task_id = %ptid,
+                                error = %e,
+                                "TaskFailed: failed to update linked task status"
+                            );
+                        }
                     }
                     crate::daemon::record_background_agent_finished(
                         task_id.as_str(),
@@ -3329,6 +4106,47 @@ pub(crate) async fn run(
                             }
                         }
                     }
+
+                    // Adaptive re-planning: cascade failure to dependent tasks
+                    // and inject a system_reminder to prompt the model to re-plan.
+                    if !was_cancelled && factory_mode_enabled() {
+                        let cascaded_ids = app.task_store.cascade_failure(task_id.as_str());
+                        let subject = app
+                            .task_store
+                            .get(task_id.as_str())
+                            .map(|t| t.subject.clone())
+                            .unwrap_or_default();
+                        let cascaded_str = if cascaded_ids.is_empty() {
+                            "none".to_string()
+                        } else {
+                            cascaded_ids
+                                .iter()
+                                .map(|id| id.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        };
+                        let reminder = format!(
+                            "Task {task_id} ({subject}) failed: {error}. Dependent tasks [{cascaded_str}] have been cancelled. \
+                             Review the failure and either:\n\
+                             1. Fix the issue and re-create the failed task with TaskCreate\n\
+                             2. Revise the plan by creating replacement tasks\n\
+                             3. Mark the remaining work as not needed via TaskUpdate(status=deleted)"
+                        );
+                        // Auto-create a replan task so the factory can pick it up
+                        if let Some(replan) = app.task_store.create_replan_task(task_id.as_str()) {
+                            tracing::info!(
+                                target: "jfc::tasks::factory",
+                                failed_id = %task_id,
+                                replan_id = %replan.id,
+                                "auto-created replan task for failed task"
+                            );
+                        }
+                        crate::system_reminder::append_to_last_user(
+                            &mut app.messages,
+                            &reminder,
+                        );
+                        maybe_continue_task_factory(&mut app, &tx).await;
+                    }
                 }
                 AppEvent::TeammateSpawned {
                     name,
@@ -3337,6 +4155,7 @@ pub(crate) async fn run(
                     color,
                     agent_type,
                     cwd,
+                    abort_tx,
                 } => {
                     // Activate the team if this is the first teammate to
                     // join — switches the leader from "no team" to "running
@@ -3350,12 +4169,24 @@ pub(crate) async fn run(
                             crate::swarm::TEAM_LEAD_NAME,
                             &team_name,
                         ));
-                        app.task_store = crate::tasks::TaskStore::open_team(&team_name);
+                        // Activate the team task store. Migrate any tasks
+                        // already created in the session store so IDs
+                        // remain valid — the leader frequently TaskCreates
+                        // a plan before the first teammate spawn, and
+                        // those IDs would otherwise vanish at team
+                        // activation. See `TaskStore::migrate_from`.
+                        let team_store = crate::tasks::TaskStore::open_team(&team_name);
+                        let _ = team_store.migrate_from(&app.task_store);
+                        app.task_store = team_store;
                     }
                     // Register the teammate in the in-memory roster. The
                     // render code reads this to draw the teammate tree and
                     // power per-name lookups; previously the HashMap stayed
-                    // empty regardless of how many teammates spawned.
+                    // empty regardless of how many teammates spawned. The
+                    // `abort_tx` is critical — it keeps the runner's
+                    // watch channel alive for the teammate's lifetime.
+                    // Without storing it here, every teammate was marked
+                    // "Done" on its first poll.
                     app.team_context.teammates.insert(
                         agent_id.clone(),
                         crate::swarm::types::TeammateInfo {
@@ -3365,6 +4196,7 @@ pub(crate) async fn run(
                             cwd,
                             spawned_at: std::time::Instant::now(),
                             backend: crate::swarm::types::BackendType::InProcess,
+                            abort_tx,
                         },
                     );
                 }
@@ -3497,9 +4329,18 @@ fn sync_detached_background_tasks_from_daemon_with_paths(
     app: &mut App,
     paths: &crate::daemon::DaemonPaths,
 ) -> bool {
-    let Some(state) = crate::daemon::load_state(paths) else {
+    // mtime-gate the read. When background workers haven't reported any
+    // progress since our last poll, the daemon-state.json mtime is
+    // unchanged and we can skip the (potentially MB-sized) read + JSON
+    // parse + walk on the render thread. This is the primary CPU-burn
+    // fix for sessions that have accumulated hundreds of completed
+    // background agents in daemon-state.json.
+    let Some((state, mtime)) =
+        crate::daemon::load_state_if_changed(paths, app.last_detached_state_mtime)
+    else {
         return false;
     };
+    app.last_detached_state_mtime = Some(mtime);
     let session_id = app.current_session_id.as_ref().map(|id| id.to_string());
     let mut changed = false;
     for (id, agent) in &state.background_agents {
@@ -3539,6 +4380,7 @@ fn sync_detached_background_tasks_from_daemon_with_paths(
                     error: agent.error.clone(),
                     last_tool: agent.last_tool.clone(),
                     messages: Vec::new(),
+                    chat_messages: Vec::new(),
                     tool_use_count: agent.tool_use_count,
                     latest_input_tokens: agent.latest_input_tokens,
                     latest_cache_read_tokens: agent.latest_cache_read_tokens,
@@ -3547,6 +4389,14 @@ fn sync_detached_background_tasks_from_daemon_with_paths(
                     model_used: agent.model.clone(),
                     max_input_tokens: None,
                     budget_killed: false,
+                    // Detached workers update their linked task in their
+                    // own process (they hold the session/team TaskStore
+                    // directly); the UI picks those writes up via
+                    // `TaskStore::reload_if_changed`. The daemon roster
+                    // doesn't carry the parent_task_id back, so the UI-side
+                    // BackgroundTask row leaves it None — the todo still
+                    // transitions correctly, just not through this struct.
+                    parent_task_id: None,
                 });
 
         if entry.description != agent.description {
@@ -3554,7 +4404,15 @@ fn sync_detached_background_tasks_from_daemon_with_paths(
             changed = true;
         }
         if entry.status != new_status {
+            // Detect transitions TO a terminal state (Completed/Failed/
+            // Cancelled). Increment the counter so `handle_submit` can
+            // inject a system_reminder telling the parent model that
+            // agent results are available in the transcript.
+            let was_terminal = entry.status.is_terminal();
             entry.status = new_status;
+            if !was_terminal && new_status.is_terminal() {
+                app.background_tasks_completed_since_last_turn += 1;
+            }
             changed = true;
         }
         if entry.tool_use_count != agent.tool_use_count {
@@ -3671,6 +4529,7 @@ fn restore_persistent_background_agents(app: &mut App) {
                 error: agent.error,
                 last_tool: None,
                 messages,
+                chat_messages: Vec::new(),
                 tool_use_count: agent.tool_use_count,
                 latest_input_tokens: agent.latest_input_tokens,
                 latest_cache_read_tokens: 0,
@@ -3679,6 +4538,10 @@ fn restore_persistent_background_agents(app: &mut App) {
                 model_used: agent.model,
                 max_input_tokens: None,
                 budget_killed: false,
+                // Restored from the daemon roster, which doesn't persist
+                // the parent_task_id link. The linked todo's status was
+                // already written to the TaskStore JSON by the worker.
+                parent_task_id: None,
             },
         );
     }
@@ -3742,6 +4605,200 @@ fn set_terminal_title(app: &App) {
     }
     *guard = title.clone();
     let _ = execute!(io::stdout(), SetTitle(title));
+}
+
+/// Fire the `/goal` evaluator when the user has an active stop
+/// condition and the agent has just settled on EndTurn. Returns `true`
+/// when the dispatch happened (and the caller must NOT drain queued
+/// prompts yet), `false` when there's no active goal so the loop can
+/// proceed normally.
+fn dispatch_goal_evaluator_if_active(
+    app: &mut app::App,
+    tx: &mpsc::Sender<crate::app::AppEvent>,
+) -> bool {
+    let Some(goal) = app.goal.as_ref() else {
+        return false;
+    };
+    if app.goal_evaluator_in_flight {
+        // A prior evaluator is still running — the verdict it returns
+        // will re-drive the loop. Don't double-fire.
+        tracing::debug!(target: "jfc::goal", "evaluator already in flight, skipping");
+        return true;
+    }
+    if goal.is_exhausted() {
+        // Burned the iteration budget. Stamp the failure banner and
+        // clear the goal so the loop can drain queued prompts normally.
+        let banner = crate::goal::format_exhaustion_banner(goal);
+        app.messages.push(types::ChatMessage::assistant(banner));
+        app.goal = None;
+        crate::toast::push_with_cap(
+            &mut app.toasts,
+            crate::toast::Toast::new(
+                crate::toast::ToastKind::Error,
+                "Goal abandoned — iteration cap reached".to_owned(),
+            ),
+        );
+        return false;
+    }
+    app.goal_evaluator_in_flight = true;
+    let condition = goal.condition.clone();
+    let history = app.messages.clone();
+    let provider = std::sync::Arc::clone(&app.provider);
+    let model = app.model.clone();
+    let cancel = app.cancel_token.clone();
+    let tx_eval = tx.clone();
+    tokio::spawn(async move {
+        // Race against cancellation so an ESC×2 mid-evaluation doesn't
+        // strand a pending verdict for the next turn.
+        let verdict = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                tracing::info!(target: "jfc::goal", "evaluator cancelled before reply");
+                return;
+            }
+            v = crate::goal::evaluate(provider.as_ref(), model, &condition, &history) => v,
+        };
+        let event = match verdict {
+            Ok(v) => crate::app::AppEvent::GoalVerdict {
+                ok: v.ok,
+                reason: v.reason,
+            },
+            Err(e) => {
+                tracing::warn!(
+                    target: "jfc::goal",
+                    error = %e,
+                    "evaluator call failed — surfacing as unmet"
+                );
+                crate::app::AppEvent::GoalVerdict {
+                    ok: false,
+                    reason: format!("evaluator error: {e}"),
+                }
+            }
+        };
+        let _ = tx_eval.send(event).await;
+    });
+    true
+}
+
+/// Handle a goal verdict. On success: append the banner to the
+/// current assistant message (NOT a new one — would violate the
+/// consecutive-assistant invariant) and clear the goal. On unmet:
+/// push a fresh user/meta turn carrying the "what's missing" reminder
+/// (NOT patched into the prior user msg — chronology would be wrong
+/// and the provider's "Continue from where you left off." fallback
+/// would beat the evaluator's actual diagnostic), then restart the
+/// agentic loop.
+async fn handle_goal_verdict(
+    app: &mut app::App,
+    tx: &mpsc::Sender<crate::app::AppEvent>,
+    ok: bool,
+    reason: String,
+) {
+    app.goal_evaluator_in_flight = false;
+    let Some(mut goal) = app.goal.take() else {
+        // User cleared the goal mid-evaluation. Resume the normal
+        // EndTurn flow.
+        persist_goal_for_session(app);
+        drain_queued_prompts(app, tx).await;
+        maybe_continue_task_factory(app, tx).await;
+        return;
+    };
+    if ok {
+        let banner = crate::goal::format_success_banner(&goal, &reason);
+        append_to_last_assistant_or_push(&mut app.messages, &banner);
+        crate::toast::push_with_cap(
+            &mut app.toasts,
+            crate::toast::Toast::new(
+                crate::toast::ToastKind::Success,
+                "Goal achieved".to_owned(),
+            ),
+        );
+        // Goal completed → take() already cleared it, persist removes
+        // the sidecar so a future /continue doesn't revive it.
+        persist_goal_for_session(app);
+        drain_queued_prompts(app, tx).await;
+        maybe_continue_task_factory(app, tx).await;
+        return;
+    }
+    // Unmet: bump counter, store reason, inject reminder, continue loop.
+    goal.iterations += 1;
+    goal.last_unmet_reason = Some(reason.clone());
+    if goal.is_exhausted() {
+        let banner = crate::goal::format_exhaustion_banner(&goal);
+        append_to_last_assistant_or_push(&mut app.messages, &banner);
+        crate::toast::push_with_cap(
+            &mut app.toasts,
+            crate::toast::Toast::new(
+                crate::toast::ToastKind::Error,
+                "Goal abandoned — iteration cap reached".to_owned(),
+            ),
+        );
+        // Goal abandoned — `goal` is dropped here (never put back on
+        // `app`), so persist removes the sidecar.
+        persist_goal_for_session(app);
+        drain_queued_prompts(app, tx).await;
+        maybe_continue_task_factory(app, tx).await;
+        return;
+    }
+    let iteration = goal.iterations;
+    let condition = goal.condition.clone();
+    app.goal = Some(goal);
+    // Persist the bumped iteration count so a /continue mid-loop
+    // resumes from the right iteration rather than restarting at 0.
+    persist_goal_for_session(app);
+    let reminder = crate::goal::format_unmet_reminder(&condition, &reason, iteration);
+    // Push a fresh user-role turn that carries the reminder. The
+    // transcript shape becomes `[..., assistant, user(reminder),
+    // assistant(new)]` — clean alternation, the reminder is the
+    // newest content the next stream sees, and the provider doesn't
+    // fall back to its generic "Continue from where you left off."
+    // because the trailing user message has real content. We wrap the
+    // body in a <system-reminder> so the model treats it as
+    // background context, not a user instruction.
+    let body = crate::system_reminder::format(&reminder);
+    app.messages.push(crate::types::ChatMessage::user(body));
+    tracing::info!(
+        target: "jfc::goal",
+        iteration,
+        "goal unmet — pushed fresh user turn + continuing agentic loop"
+    );
+    stream::continue_agentic_loop(app, tx).await;
+}
+
+/// Append `body` as a new `MessagePart::Text` on the last assistant
+/// message (preferring the streaming one if set, else the final
+/// assistant in `messages`). Falls back to pushing a fresh assistant
+/// message ONLY when no assistant exists — because the transcript
+/// invariants forbid two consecutive assistants. The fallback path is
+/// for the edge case where the goal evaluator returns before any
+/// assistant turn has run.
+fn append_to_last_assistant_or_push(messages: &mut Vec<types::ChatMessage>, body: &str) {
+    use crate::types::{MessagePart, Role};
+    let target_idx = messages
+        .iter()
+        .rposition(|m| m.role == Role::Assistant);
+    let appended = format!("\n\n{body}");
+    if let Some(idx) = target_idx {
+        messages[idx]
+            .parts
+            .push(MessagePart::Text(appended));
+        return;
+    }
+    // No assistant in the transcript yet — push one. Safe because
+    // there can't be a "consecutive assistant" violation when no
+    // assistant exists.
+    messages.push(crate::types::ChatMessage::assistant(body.to_owned()));
+}
+
+/// Mirror `app.goal` to the sidecar file beside the session journal.
+/// Called at every goal mutation point (set / clear / unmet bump /
+/// success / exhaustion) so `/continue` rebuilds the same state.
+/// No-op when there's no current session yet.
+fn persist_goal_for_session(app: &app::App) {
+    let Some(sid) = app.current_session_id.as_ref() else {
+        return;
+    };
+    crate::goal::save_sidecar(sid.as_str(), app.goal.as_ref());
 }
 
 fn update_task_activities(app: &mut app::App, calls: &[types::ToolCall]) {

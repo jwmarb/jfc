@@ -320,7 +320,15 @@ fn info_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
 
     lines.push(section("Context"));
 
-    let total_tokens = (app.last_usage_input as u64).max(app.tool_ctx.approx_tokens as u64);
+    // Always render the calibrated `approx_tokens` (input + output +
+    // cache_read + cache_write) — that's what `recompute_token_estimate`
+    // / StreamUsage / compaction all use. Previously this took
+    // `max(last_usage_input, approx_tokens)`, which was a no-op (approx
+    // always ≥ input alone) but obscured the fact that the sidebar and
+    // bottom-bar gauge were already computing the same thing two
+    // different ways, leaving a maintenance footgun where one could
+    // drift from the other.
+    let total_tokens = app.tool_ctx.approx_tokens as u64;
     let ctx_max = app.selected_context_window_tokens().max(1) as u64;
     let pct = (total_tokens as f64 / ctx_max as f64 * 100.0).min(100.0);
 
@@ -748,7 +756,8 @@ fn info_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
 
     let provider_name = app.provider.name();
     let effort_badge = effort_status_badge(app);
-    let provider_suffix = format!(" local · {effort_badge}");
+    let fast_badge = if app.fast_mode { " · ⚡ FAST" } else { "" };
+    let provider_suffix = format!(" local · {effort_badge}{fast_badge}");
     let provider_width = inner
         .width
         .saturating_sub(2 + provider_suffix.chars().count() as u16)
@@ -1651,7 +1660,8 @@ fn messages(f: &mut Frame, app: &mut App, area: Rect) {
     // is no longer needed — items are required for paint anyway, and
     // `tool_block_height` now memoizes the integer height per terminal-state
     // tool, so the per-item .sum() is a string of hash lookups.
-    let items = crate::message_view::build_render_items_pub(app, inner_width);
+    let render_ctx = crate::message_view::RenderCtx::from_app(app);
+    let items = crate::message_view::build_render_items_pub(&render_ctx, inner_width);
     let total_lines: usize = items.iter().map(|i| i.height(inner_width)).sum();
 
     let visible = area.height.saturating_sub(2) as usize;
@@ -1939,28 +1949,33 @@ pub(crate) fn task_view_body_lines(
 
 fn messages_task_view(f: &mut Frame, app: &mut App, area: Rect, task_id: &str) {
     let t = app.theme;
-    let inner_width = area.width.saturating_sub(2) as usize;
+    // Reserve same width as the main view: borders(2) + padding(2) + scrollbar(1) = 5
+    let inner_width = area.width.saturating_sub(5) as usize;
 
-    let (title_str, body_lines) = match app.background_tasks.get(task_id) {
-        None => (format!("task {task_id} (not found)"), Vec::new()),
+    let (title_str, body_lines, use_message_view) = match app.background_tasks.get(task_id) {
+        None => (format!("task {task_id} (not found)"), Vec::new(), false),
         Some(bt) => {
             let title = format!(
                 " {} · {} ",
                 &bt.task_id.as_str()[..bt.task_id.as_str().len().min(12)],
                 bt.description
             );
-            // Look up per-task expansion state. Empty set means
-            // "nothing manually expanded" — collapse threshold still
-            // applies. For finished tasks the body renderer also
-            // bypasses the threshold so the user sees the full
-            // result without pressing `o`.
-            static EMPTY: std::sync::OnceLock<std::collections::HashSet<usize>> =
-                std::sync::OnceLock::new();
-            let empty = EMPTY.get_or_init(std::collections::HashSet::new);
-            let expanded = app.viewing_task_expanded.get(task_id).unwrap_or(empty);
-            let task_done = matches!(bt.status, crate::types::TaskLifecycle::Completed);
-            let lines = task_view_body_lines(&bt.messages, expanded, &t, inner_width, task_done);
-            (title, lines)
+            // Use the rich MessageView pipeline when we have structured messages.
+            // Fall back to the markdown string renderer for tasks that have no
+            // chat_messages yet (e.g. daemon-launched detached agents whose events
+            // only arrive as TaskProgress strings).
+            let use_mv = !bt.chat_messages.is_empty();
+            if use_mv {
+                (title, Vec::new(), true)
+            } else {
+                static EMPTY: std::sync::OnceLock<std::collections::HashSet<usize>> =
+                    std::sync::OnceLock::new();
+                let empty = EMPTY.get_or_init(std::collections::HashSet::new);
+                let expanded = app.viewing_task_expanded.get(task_id).unwrap_or(empty);
+                let task_done = matches!(bt.status, crate::types::TaskLifecycle::Completed);
+                let lines = task_view_body_lines(&bt.messages, expanded, &t, inner_width, task_done);
+                (title, lines, false)
+            }
         }
     };
 
@@ -1987,91 +2002,164 @@ fn messages_task_view(f: &mut Frame, app: &mut App, area: Rect, task_id: &str) {
     // hint so the user can tell the difference between "still
     // streaming" and "agent finished its turn, waiting for next ping"
     // without staring at the panel for a few seconds.
-    let mut body_lines = body_lines;
-    if task_is_running {
-        let frame = (app.launched_at.elapsed().as_millis() / 80) as usize;
-        let spinner_glyph = crate::app::SPINNER[frame % crate::app::SPINNER.len()];
-        if !body_lines.is_empty() {
-            body_lines.push(Line::from(""));
-        }
-        body_lines.push(Line::from(vec![
-            Span::styled(
-                spinner_glyph.to_string(),
-                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled("Receiving output…", Style::default().fg(t.text_muted)),
-        ]));
-    } else if task_is_idle {
-        if !body_lines.is_empty() {
-            body_lines.push(Line::from(""));
-        }
-        body_lines.push(Line::from(vec![
-            Span::styled("⏸  ", Style::default().fg(t.text_muted)),
-            Span::styled(
-                "idle — waiting for next message",
-                Style::default()
-                    .fg(t.text_muted)
-                    .add_modifier(Modifier::ITALIC),
-            ),
-        ]));
-    }
-
-    // Compute total *visual* rows accounting for word-wrap. Each
-    // `Line` can occupy more than one visual row when it wraps at
-    // `inner.width`. Counting logical lines (`body_lines.len()`)
-    // undercounts and makes follow_bottom stop short of the true end.
-    let render_width = inner.width;
-    let total_lines: usize = body_lines
-        .iter()
-        .map(|line| {
-            if line.width() == 0 || render_width == 0 {
-                1
-            } else {
-                Paragraph::new(line.clone())
-                    .wrap(ratatui::widgets::Wrap { trim: false })
-                    .line_count(render_width)
-                    .max(1)
-            }
-        })
-        .sum();
     let visible = inner.height as usize;
 
-    // Pin to bottom while the task is streaming so each new chunk is
-    // visible without manual scrolling. If the user explicitly
-    // scrolled up (`follow_bottom` flipped off), respect that instead.
-    if app.follow_bottom || task_is_running {
-        app.scroll_offset = total_lines.saturating_sub(visible);
-    }
+    if use_message_view {
+        // Rich MessageView path — same pipeline as the main chat.
+        use crate::message_view::{MessageView, PrebuiltItems, RenderCtx, build_render_items_ctx};
+        use ratatui::widgets::Widget;
 
-    app.total_lines = total_lines;
-    app.viewport_height = visible;
+        let chat_msgs = app
+            .background_tasks
+            .get(task_id)
+            .map(|bt| bt.chat_messages.as_slice())
+            .unwrap_or(&[]);
 
-    if body_lines.is_empty() {
-        let placeholder_text = if task_is_running {
-            "Waiting for first chunk…"
-        } else {
-            "No messages yet for this background task."
+        // Compute scroll BEFORE borrowing app through items, then assign after.
+        let total_lines_est = {
+            let msgs = app
+                .background_tasks
+                .get(task_id)
+                .map(|bt| bt.chat_messages.as_slice())
+                .unwrap_or(&[]);
+            let ctx = RenderCtx::from_task(msgs, app);
+            let est_items = build_render_items_ctx(&ctx, inner_width);
+            est_items.iter().map(|i| i.height(inner_width)).sum::<usize>()
         };
-        let placeholder = Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                placeholder_text,
-                Style::default().fg(t.text_muted),
-            )),
-        ])
-        .style(Style::default().bg(t.bg));
-        f.render_widget(placeholder, inner);
+        let new_scroll = if app.follow_bottom {
+            total_lines_est.saturating_sub(visible)
+        } else if app.scroll_offset + visible > total_lines_est {
+            total_lines_est.saturating_sub(visible)
+        } else {
+            app.scroll_offset
+        };
+        app.scroll_offset = new_scroll;
+        app.total_lines = total_lines_est;
+        app.viewport_height = visible;
+
+        // Now build items for real (same data, but app.scroll_offset is now settled).
+        let ctx = RenderCtx::from_task(chat_msgs, app);
+        let items = build_render_items_ctx(&ctx, inner_width);
+        let mv = MessageView {
+            app,
+            prebuilt: Some(PrebuiltItems {
+                items,
+                total_h: total_lines_est,
+                scroll: new_scroll,
+            }),
+        };
+        mv.render(inner, f.buffer_mut());
+
+        // Spinner / idle hint: paint it below the MessageView content
+        // in whatever space remains (or overlap the last row if full).
+        if task_is_running || task_is_idle {
+            let frame = (app.launched_at.elapsed().as_millis() / 80) as usize;
+            let hint_line = if task_is_running {
+                let spinner_glyph = crate::app::SPINNER[frame % crate::app::SPINNER.len()];
+                Line::from(vec![
+                    Span::styled(
+                        spinner_glyph.to_string(),
+                        Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    Span::styled("Receiving output…", Style::default().fg(t.text_muted)),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled("⏸  ", Style::default().fg(t.text_muted)),
+                    Span::styled(
+                        "idle — waiting for next message",
+                        Style::default().fg(t.text_muted).add_modifier(Modifier::ITALIC),
+                    ),
+                ])
+            };
+            // Render the hint in a 1-row strip at the bottom of the inner area.
+            if inner.height >= 1 {
+                let hint_area = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
+                f.render_widget(
+                    Paragraph::new(hint_line).style(Style::default().bg(t.bg)),
+                    hint_area,
+                );
+            }
+        }
     } else {
-        // Use Paragraph::scroll() instead of manual skip/take so
-        // the scroll offset operates in visual rows (matching the
-        // word-wrap-aware total_lines above). Manual skip/take
-        // operates per logical Line which desyncs when lines wrap.
-        let para = Paragraph::new(body_lines)
-            .style(Style::default().bg(t.bg))
-            .wrap(ratatui::widgets::Wrap { trim: false })
-            .scroll((app.scroll_offset as u16, 0));
-        f.render_widget(para, inner);
+        // Legacy string-log path — used for daemon-launched agents whose
+        // events only arrive as TaskProgress strings with no structured data.
+        let mut body_lines = body_lines;
+        if task_is_running {
+            let frame = (app.launched_at.elapsed().as_millis() / 80) as usize;
+            let spinner_glyph = crate::app::SPINNER[frame % crate::app::SPINNER.len()];
+            if !body_lines.is_empty() {
+                body_lines.push(Line::from(""));
+            }
+            body_lines.push(Line::from(vec![
+                Span::styled(
+                    spinner_glyph.to_string(),
+                    Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled("Receiving output…", Style::default().fg(t.text_muted)),
+            ]));
+        } else if task_is_idle {
+            if !body_lines.is_empty() {
+                body_lines.push(Line::from(""));
+            }
+            body_lines.push(Line::from(vec![
+                Span::styled("⏸  ", Style::default().fg(t.text_muted)),
+                Span::styled(
+                    "idle — waiting for next message",
+                    Style::default()
+                        .fg(t.text_muted)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]));
+        }
+
+        let render_width = inner.width;
+        let total_lines: usize = body_lines
+            .iter()
+            .map(|line| {
+                if line.width() == 0 || render_width == 0 {
+                    1
+                } else {
+                    Paragraph::new(line.clone())
+                        .wrap(ratatui::widgets::Wrap { trim: false })
+                        .line_count(render_width)
+                        .max(1)
+                }
+            })
+            .sum();
+
+        if app.follow_bottom {
+            app.scroll_offset = total_lines.saturating_sub(visible);
+        } else if app.scroll_offset + visible > total_lines {
+            app.scroll_offset = total_lines.saturating_sub(visible);
+        }
+        app.total_lines = total_lines;
+        app.viewport_height = visible;
+
+        if body_lines.is_empty() {
+            let placeholder_text = if task_is_running {
+                "Waiting for first chunk…"
+            } else {
+                "No messages yet for this background task."
+            };
+            let placeholder = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    placeholder_text,
+                    Style::default().fg(t.text_muted),
+                )),
+            ])
+            .style(Style::default().bg(t.bg));
+            f.render_widget(placeholder, inner);
+        } else {
+            let para = Paragraph::new(body_lines)
+                .style(Style::default().bg(t.bg))
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .scroll((app.scroll_offset as u16, 0));
+            f.render_widget(para, inner);
+        }
     }
 }
 
@@ -3151,6 +3239,11 @@ fn status(f: &mut Frame, app: &App, area: Rect) {
 
     badges.push(effort_status_badge(app));
 
+    // Fast mode indicator
+    if app.fast_mode {
+        badges.push("⚡ FAST".to_string());
+    }
+
     // OAuth profile
     match (&app.subscription_type, &app.seat_tier) {
         (Some(sub), Some(tier)) => badges.push(format!("{}·{}", sub, tier)),
@@ -3551,6 +3644,11 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/setup-github-actions",
         "scaffold .github/workflows/jfc-review.yml",
     ),
+    ("/plan", "draft or update PLAN.md (Atlas-compatible)"),
+    ("/roadmap", "draft or update ROADMAP.md (stable decimal IDs)"),
+    ("/parity", "draft or update PARITY.md (evidence required)"),
+    ("/philosophy", "draft or update PHILOSOPHY.md"),
+    ("/usage", "draft or update USAGE.md (operator commands)"),
 ];
 
 /// Returns the `/<prefix>` the user is currently typing, when the
@@ -3835,6 +3933,43 @@ fn help_overlay(f: &mut Frame, app: &App) {
                 Span::styled((*desc).to_string(), Style::default().fg(t.text_secondary)),
             ]));
         }
+    }
+
+    // ── Custom keybindings from ~/.config/jfc/keybindings.toml ───────────
+    let custom = crate::keybindings::all_bindings();
+    if !custom.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Custom bindings".to_string(),
+            t.style_accent
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        )));
+        for (key_str, desc) in &custom {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("{key_str:<24}"),
+                    Style::default()
+                        .fg(t.text_primary)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(desc.clone(), Style::default().fg(t.text_secondary)),
+            ]));
+        }
+    } else {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Custom bindings".to_string(),
+            t.style_accent
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        )));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "none — create ~/.config/jfc/keybindings.toml to add your own",
+                Style::default().fg(t.text_muted),
+            ),
+        ]));
     }
 
     let para = Paragraph::new(lines)
@@ -5502,6 +5637,8 @@ mod pure_helper_tests {
             cost_tier: None,
             elapsed: None,
             usage: None,
+            queued: false,
+            attachments: Vec::new(),
         });
         let cfg = comet_config_from_state(&app, app.theme, 1);
         assert_eq!(cfg.head, app.theme.warning);
@@ -5928,6 +6065,8 @@ mod pure_helper_tests {
             cost_tier: None,
             elapsed: None,
             usage: None,
+            queued: false,
+            attachments: Vec::new(),
         });
         let stats = collect_diff_stats(&app);
         assert_eq!(stats.total_files, 1);
@@ -5969,6 +6108,8 @@ mod pure_helper_tests {
                 cost_tier: None,
                 elapsed: None,
                 usage: None,
+                queued: false,
+                attachments: Vec::new(),
             });
         }
         let stats = collect_diff_stats(&app);
@@ -6049,6 +6190,7 @@ mod subagent_counter_tests {
             error: None,
             last_tool: None,
             messages: Vec::new(),
+            chat_messages: Vec::new(),
             tool_use_count: tools,
             latest_input_tokens: in_tok,
             latest_cache_read_tokens: 0,
@@ -6057,6 +6199,7 @@ mod subagent_counter_tests {
             model_used: None,
             max_input_tokens: None,
             budget_killed: false,
+            parent_task_id: None,
         }
     }
 

@@ -12,6 +12,8 @@ mod cost;
 mod credential_vault;
 mod diagnostics;
 mod diagnostics_producer;
+mod document_formats;
+mod goal;
 mod effort;
 mod env_context;
 mod event_loop;
@@ -24,6 +26,7 @@ mod idle_prefetch;
 mod ids;
 mod inline_tools;
 mod input;
+mod keybindings;
 mod lsp_client;
 mod lsp_rpc;
 mod managed_session;
@@ -35,6 +38,7 @@ mod mentions;
 mod message_view;
 mod notifications;
 mod output_style;
+mod plan_cache;
 mod provider;
 mod providers;
 mod push_notifications;
@@ -66,6 +70,8 @@ mod worktrees;
 #[cfg(feature = "background-agents")]
 mod background;
 mod daemon;
+mod hallucination_guard;
+mod slop_guard;
 #[cfg(feature = "hashline")]
 mod hashline;
 #[cfg(feature = "hooks")]
@@ -130,6 +136,17 @@ struct Cli {
     #[arg(long, short = 'm', value_name = "MODEL")]
     model: Option<String>,
 
+    /// Initial permission mode. Matches Claude Code 2.1.141's
+    /// `--permission-mode` flag: lets a caller boot directly into a
+    /// non-default mode without going through Shift+Tab inside the
+    /// TUI. One of: `default`, `plan`, `accept-edits` (or
+    /// `acceptedits`), `bypass` (or `bypasspermissions`), `auto`.
+    ///
+    /// Unknown values are logged and ignored — we don't refuse to
+    /// boot just because the flag is misspelled.
+    #[arg(long = "permission-mode", value_name = "MODE")]
+    permission_mode: Option<String>,
+
     /// Subcommand. When omitted, jfc launches the interactive TUI.
     #[command(subcommand)]
     command: Option<Command>,
@@ -169,6 +186,46 @@ enum AuthSubcommand {
         #[command(subcommand)]
         sub: LiteLLMAuthSubcommand,
     },
+    /// OpenWebUI account commands (Shibboleth + Duo OIDC, manual JWT, etc.).
+    Openwebui {
+        #[command(subcommand)]
+        sub: OpenWebUIAuthSubcommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum OpenWebUIAuthSubcommand {
+    /// Automated OIDC login (Shibboleth + Duo 2FA). Requires OWUI_USERNAME +
+    /// OWUI_PASSWORD env vars; OWUI_DUO_PASSCODE is optional (uses push if unset).
+    Login {
+        /// OpenWebUI base URL (default: $OWUI_BASE_URL or https://chat.ai2s.org).
+        base_url: Option<String>,
+    },
+    /// Add an account by manually pasting a JWT.
+    Add {
+        /// OpenWebUI base URL.
+        base_url: String,
+        /// JWT cookie value (3-segment).
+        token: String,
+    },
+    /// List configured accounts.
+    List,
+    /// Switch to a different account.
+    Use {
+        /// Account name (e.g. user@example.com@chat.example.com).
+        name: String,
+    },
+    /// Remove an account.
+    Remove {
+        /// Account name.
+        name: String,
+    },
+    /// List models accessible to the active account.
+    Models,
+    /// Verify the active account's token + show user identity.
+    Whoami,
+    /// Show OpenWebUI instance config (name, version, features).
+    Config,
 }
 
 #[derive(Subcommand, Debug)]
@@ -296,6 +353,44 @@ enum DaemonSubcommand {
     },
 }
 
+/// Parse the `--permission-mode` CLI value into the `PermissionMode`
+/// enum. Accepts the canonical labels jfc uses (`default`, `plan`,
+/// `accept-edits`, `bypass`, `auto`) plus their hyphen-stripped
+/// equivalents (`acceptedits`, `bypasspermissions`) and the v141
+/// `bypassPermissions` casing for parity with Claude Code's spelling.
+///
+/// Returns `None` for `None` input or unknown labels — boot proceeds
+/// in the default mode and the misuse is logged. We don't refuse to
+/// start the TUI just because the flag is misspelled.
+pub(crate) fn parse_permission_mode(raw: Option<&str>) -> Option<crate::app::PermissionMode> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let normalized = raw.to_ascii_lowercase().replace('-', "").replace('_', "");
+    let mode = match normalized.as_str() {
+        "default" | "normal" => crate::app::PermissionMode::Default,
+        "plan" => crate::app::PermissionMode::Plan,
+        "acceptedits" | "edits" => crate::app::PermissionMode::AcceptEdits,
+        "bypass" | "bypasspermissions" | "yolo" => crate::app::PermissionMode::BypassPermissions,
+        "auto" => crate::app::PermissionMode::Auto,
+        _ => {
+            tracing::warn!(
+                target: "jfc::cli",
+                raw = %raw,
+                "--permission-mode: unknown value, falling back to Default"
+            );
+            return None;
+        }
+    };
+    tracing::info!(
+        target: "jfc::cli",
+        ?mode,
+        "applied --permission-mode"
+    );
+    Some(mode)
+}
+
 /// Session to load at startup based on CLI args
 pub(crate) enum StartupSession {
     /// No session to load — start fresh
@@ -318,8 +413,15 @@ impl Cli {
     }
 }
 
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 #[tokio::main(worker_threads = 4)]
 async fn main() -> anyhow::Result<()> {
+    #[cfg(feature = "dhat-heap")]
+    let _dhat_profiler = dhat::Profiler::new_heap();
+
     let cli = Cli::parse();
 
     // Tracing → file under `~/.config/jfc/logs/`. Stderr writes corrupted the
@@ -339,12 +441,53 @@ async fn main() -> anyhow::Result<()> {
     // hooks land via .claude/settings.json in a future pass). Idempotent.
     crate::hooks::init_global(crate::hooks::default_registry());
 
+    // Clean up tool-result spill files older than 24h to prevent unbounded /tmp growth.
+    crate::stream::cleanup_tool_result_spills(std::time::Duration::from_secs(24 * 3600));
+
     // v132 file watcher: install on startup so CLAUDE.md /
     // .claude/agents/*.md / settings.toml edits emit a system-reminder
     // on the next turn instead of waiting for a session restart. The
     // Tick handler in the main loop polls the change counter and
     // emits the reminder when it sees a bump.
     crate::file_watcher::install();
+    crate::keybindings::load();
+
+    // One-shot startup compaction of `daemon-state.json`. Long-lived users
+    // accumulate hundreds of completed background-agent records here; the
+    // UI re-reads the file every second on the render thread, so an
+    // unbounded roster turns into a real CPU sink (~38% steady-state on
+    // a 1.4 MB file with ~500 entries). Drop anything past the retention
+    // window AND anything beyond the most-recent cap. Best-effort —
+    // failures are silent because compaction is a hygiene step, not a
+    // correctness invariant.
+    {
+        let paths = crate::daemon::DaemonPaths::default_user();
+        if let Some(mut state) = crate::daemon::load_state(&paths) {
+            let dropped = crate::daemon::compact_background_agents(
+                &mut state,
+                std::time::SystemTime::now(),
+                crate::daemon::TERMINAL_AGENT_RETENTION,
+                crate::daemon::TERMINAL_AGENT_CAP,
+            );
+            if dropped > 0 {
+                if let Err(err) = crate::daemon::save_state(&paths, &state) {
+                    tracing::warn!(
+                        target: "jfc::daemon",
+                        error = %err,
+                        dropped,
+                        "compact_background_agents: save_state failed"
+                    );
+                } else {
+                    tracing::info!(
+                        target: "jfc::daemon",
+                        dropped,
+                        retained = state.background_agents.len(),
+                        "compacted terminal background-agent records on startup"
+                    );
+                }
+            }
+        }
+    }
 
     // Subcommand dispatch must run before any TUI setup — `daemon start`
     // expects a clean stdout, and `daemon status / list / stop / fire`
@@ -423,6 +566,8 @@ async fn main() -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
+    let initial_permission_mode = parse_permission_mode(cli.permission_mode.as_deref());
+
     let result = event_loop::run(
         &mut terminal,
         providers,
@@ -431,6 +576,7 @@ async fn main() -> anyhow::Result<()> {
         oauth_handle,
         startup_session,
         initial_prompt,
+        initial_permission_mode,
     )
     .await;
 
@@ -539,7 +685,200 @@ async fn run_auth_subcommand(sub: AuthSubcommand) -> anyhow::Result<()> {
         AuthSubcommand::Anthropic { sub } => run_anthropic_auth_subcommand(sub).await,
         AuthSubcommand::Codex { sub } => run_codex_auth_subcommand(sub).await,
         AuthSubcommand::Litellm { sub } => run_litellm_auth_subcommand(sub).await,
+        AuthSubcommand::Openwebui { sub } => run_openwebui_auth_subcommand(sub).await,
     }
+}
+
+async fn run_openwebui_auth_subcommand(sub: OpenWebUIAuthSubcommand) -> anyhow::Result<()> {
+    use crate::providers::openwebui::{
+        default_store_path, fetch_instance_config, get_current, list_accounts, load_store,
+        normalize_base_url, oidc_login, parse_jwt_claims, remove_account, set_current,
+        upsert_account, verify_token, Account, DuoMethod, OidcLoginOptions,
+    };
+
+    let store_path = default_store_path();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let default_base = std::env::var("OWUI_BASE_URL")
+        .unwrap_or_else(|_| "https://chat.ai2s.org".to_owned());
+
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    match sub {
+        OpenWebUIAuthSubcommand::Login { base_url } => {
+            let base = normalize_base_url(&base_url.unwrap_or(default_base))?;
+            let username = std::env::var("OWUI_USERNAME")
+                .map_err(|_| anyhow::anyhow!("OWUI_USERNAME env var required"))?;
+            let password = std::env::var("OWUI_PASSWORD")
+                .map_err(|_| anyhow::anyhow!("OWUI_PASSWORD env var required"))?;
+            let passcode = std::env::var("OWUI_DUO_PASSCODE").ok();
+            let method = if passcode.is_some() {
+                DuoMethod::Passcode
+            } else {
+                DuoMethod::Push
+            };
+
+            println!("→ logging in to {base} as {username}...");
+            if matches!(method, DuoMethod::Push) {
+                println!("→ no OWUI_DUO_PASSCODE set — sending Duo Push (approve on your phone)");
+            } else {
+                println!("→ using OWUI_DUO_PASSCODE for 2FA");
+            }
+
+            let mut opts = OidcLoginOptions::new(&base, &username, &password);
+            opts.duo_passcode = passcode;
+            opts.duo_method = method;
+            let result = oidc_login(opts).await?;
+
+            let user = verify_token(&client, &base, &result.token).await?;
+            let cfg = fetch_instance_config(&client, &base).await.ok();
+            let host = url::Url::parse(&base)?.host_str().unwrap_or("").to_owned();
+            let name = format!("{}@{}", user.email, host);
+            let now = now_ms();
+
+            upsert_account(
+                &store_path,
+                Account {
+                    name: name.clone(),
+                    base_url: base.clone(),
+                    token: result.token,
+                    expires_at: Some(result.expires_at),
+                    created_at: Some(now),
+                    updated_at: Some(now),
+                    ..Default::default()
+                },
+            )?;
+            // Always make the freshly-logged-in account the active one, even
+            // if a different account was previously current.
+            let _ = set_current(&store_path, &name);
+
+            println!("\n✓ logged in as {} <{}> ({})", user.name, user.email, user.role);
+            if let Some(c) = cfg {
+                println!("  instance: {} v{}", c.name, c.version);
+            }
+            let exp = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(result.expires_at)
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_else(|| "?".into());
+            println!("  token expires: {exp}");
+            println!("  account stored as: {name}");
+        }
+        OpenWebUIAuthSubcommand::Add { base_url, token } => {
+            let base = normalize_base_url(&base_url)?;
+            let claims = parse_jwt_claims(&token)
+                .ok_or_else(|| anyhow::anyhow!("token does not decode as a JWT"))?;
+            let user = verify_token(&client, &base, &token).await?;
+            let cfg = fetch_instance_config(&client, &base).await.ok();
+            let host = url::Url::parse(&base)?.host_str().unwrap_or("").to_owned();
+            let name = format!("{}@{}", user.email, host);
+            let now = now_ms();
+            upsert_account(
+                &store_path,
+                Account {
+                    name: name.clone(),
+                    base_url: base,
+                    token,
+                    expires_at: Some(claims.exp * 1000),
+                    created_at: Some(now),
+                    updated_at: Some(now),
+                    ..Default::default()
+                },
+            )?;
+            let exp = chrono::DateTime::<chrono::Utc>::from_timestamp(claims.exp, 0)
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_else(|| "?".into());
+            println!(
+                "✓ added {name} (instance={} v{}, expires={exp})",
+                cfg.as_ref().map(|c| c.name.as_str()).unwrap_or("unknown"),
+                cfg.as_ref().map(|c| c.version.as_str()).unwrap_or("?")
+            );
+        }
+        OpenWebUIAuthSubcommand::List => {
+            let store = load_store(&store_path);
+            let current = store.current.clone();
+            let accounts = list_accounts(&store);
+            if accounts.is_empty() {
+                println!("(no accounts)");
+            } else {
+                for a in accounts {
+                    let star = if Some(&a.name) == current.as_ref() { "*" } else { " " };
+                    let exp = a
+                        .expires_at
+                        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+                        .map(|d| d.to_rfc3339())
+                        .unwrap_or_else(|| "?".into());
+                    println!("{star} {:48}  {}  expires={exp}", a.name, a.base_url);
+                }
+            }
+        }
+        OpenWebUIAuthSubcommand::Use { name } => {
+            if !set_current(&store_path, &name)? {
+                anyhow::bail!("no account named {name}");
+            }
+            println!("current → {name}");
+        }
+        OpenWebUIAuthSubcommand::Remove { name } => {
+            remove_account(&store_path, &name)?;
+            println!("removed {name}");
+        }
+        OpenWebUIAuthSubcommand::Models => {
+            let store = load_store(&store_path);
+            let account = get_current(&store).ok_or_else(|| anyhow::anyhow!("no current account"))?;
+            let res: serde_json::Value = client
+                .get(format!("{}/api/models", account.base_url.trim_end_matches('/')))
+                .header("Authorization", format!("Bearer {}", account.token))
+                .header("Accept", "application/json")
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            if let Some(arr) = res.get("data").and_then(|v| v.as_array()) {
+                for m in arr {
+                    let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                    let name = m.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    println!("{id:48}  {name}");
+                }
+                println!("\n{} model(s) accessible to {}", arr.len(), account.name);
+            }
+        }
+        OpenWebUIAuthSubcommand::Whoami => {
+            let store = load_store(&store_path);
+            let account = get_current(&store).ok_or_else(|| anyhow::anyhow!("no current account"))?;
+            let user = verify_token(&client, &account.base_url, &account.token).await?;
+            println!(
+                "{}\n  {} {} <{}>",
+                account.name, user.role, user.id, user.email
+            );
+        }
+        OpenWebUIAuthSubcommand::Config => {
+            let store = load_store(&store_path);
+            let base = get_current(&store).map(|a| a.base_url).unwrap_or(default_base);
+            let cfg = fetch_instance_config(&client, &base).await?;
+            println!("instance:  {} v{}", cfg.name, cfg.version);
+            println!("baseUrl:   {base}");
+            println!("status:    {}", if cfg.status { "online" } else { "offline" });
+            let enabled: Vec<&String> = cfg
+                .features
+                .iter()
+                .filter(|(_, v)| v.as_bool().unwrap_or(false))
+                .map(|(k, _)| k)
+                .collect();
+            if enabled.is_empty() {
+                println!("features:  (none enabled)");
+            } else {
+                let mut joined: Vec<&str> = enabled.iter().map(|s| s.as_str()).collect();
+                joined.sort();
+                println!("features:  {}", joined.join(", "));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn run_codex_auth_subcommand(sub: CodexAuthSubcommand) -> anyhow::Result<()> {
@@ -652,7 +991,7 @@ async fn run_litellm_auth_subcommand(sub: LiteLLMAuthSubcommand) -> anyhow::Resu
                     println!("url: {}", creds.base_url);
                     println!(
                         "key: {}…{}",
-                        &creds.api_key[..4],
+                        &creds.api_key[..creds.api_key.len().min(4)],
                         &creds.api_key[creds.api_key.len().saturating_sub(4)..]
                     );
                     println!("store: {}", cred_path.display());
@@ -1430,4 +1769,67 @@ fn looks_codex_model(model_id: &str) -> bool {
         .unwrap_or(model_id)
         .to_ascii_lowercase();
     id.contains("codex")
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    // Normal: each canonical permission-mode label round-trips through
+    // the parser to the matching enum variant.
+    #[test]
+    fn parse_permission_mode_canonical_labels_normal() {
+        assert_eq!(
+            parse_permission_mode(Some("default")),
+            Some(crate::app::PermissionMode::Default)
+        );
+        assert_eq!(
+            parse_permission_mode(Some("plan")),
+            Some(crate::app::PermissionMode::Plan)
+        );
+        assert_eq!(
+            parse_permission_mode(Some("accept-edits")),
+            Some(crate::app::PermissionMode::AcceptEdits)
+        );
+        assert_eq!(
+            parse_permission_mode(Some("bypass")),
+            Some(crate::app::PermissionMode::BypassPermissions)
+        );
+        assert_eq!(
+            parse_permission_mode(Some("auto")),
+            Some(crate::app::PermissionMode::Auto)
+        );
+    }
+
+    // Robust: hyphen-stripped + Claude Code v141 spellings + ambient
+    // casing all map to the same enum variant.
+    #[test]
+    fn parse_permission_mode_accepts_alternate_spellings_robust() {
+        assert_eq!(
+            parse_permission_mode(Some("acceptEdits")),
+            Some(crate::app::PermissionMode::AcceptEdits)
+        );
+        assert_eq!(
+            parse_permission_mode(Some("bypassPermissions")),
+            Some(crate::app::PermissionMode::BypassPermissions)
+        );
+        assert_eq!(
+            parse_permission_mode(Some("ACCEPT_EDITS")),
+            Some(crate::app::PermissionMode::AcceptEdits)
+        );
+        assert_eq!(
+            parse_permission_mode(Some("  Plan  ")),
+            Some(crate::app::PermissionMode::Plan)
+        );
+    }
+
+    // Robust: unknown / empty / None values all return None so boot
+    // falls through to the default mode rather than panicking.
+    #[test]
+    fn parse_permission_mode_returns_none_for_invalid_robust() {
+        assert!(parse_permission_mode(None).is_none());
+        assert!(parse_permission_mode(Some("")).is_none());
+        assert!(parse_permission_mode(Some("   ")).is_none());
+        assert!(parse_permission_mode(Some("not-a-real-mode")).is_none());
+    }
 }

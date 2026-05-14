@@ -310,8 +310,46 @@ pub(super) fn spawn_background_agent_worker_with_paths(
 
 /// Top-level entry called from `event_loop`/`stream` to launch a detached
 /// background worker for a Task.
+/// Maximum number of concurrently-running detached background agents.
+/// By default there is no limit — the agent can fire off as many background
+/// workers as it wants. Set `JFC_MAX_BACKGROUND_AGENTS` to cap it.
+fn max_running_agents() -> usize {
+    std::env::var("JFC_MAX_BACKGROUND_AGENTS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(usize::MAX)
+}
+
 pub fn spawn_background_agent_worker(launch: BackgroundAgentLaunch) -> std::io::Result<u32> {
     let paths = DaemonPaths::default_user();
+    // Enforce concurrency cap before forking a new worker. Count
+    // currently-running agents in daemon state; if at cap, return an
+    // error so the caller surfaces "too many agents" to the model
+    // instead of silently spawning unbounded processes.
+    let running_count = with_state_lock(&paths, || {
+        let state = load_state(&paths).unwrap_or_default();
+        state
+            .background_agents
+            .values()
+            .filter(|a| a.status == BackgroundAgentStatus::Running)
+            .count()
+    });
+    let cap = max_running_agents();
+    if running_count >= cap {
+        tracing::warn!(
+            target: "jfc::daemon::worker",
+            running_count, cap,
+            "background agent spawn rejected — at capacity"
+        );
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ResourceBusy,
+            format!(
+                "Cannot spawn background agent: {running_count}/{cap} already running. \
+                 Wait for one to finish or set JFC_MAX_BACKGROUND_AGENTS higher."
+            ),
+        ));
+    }
     spawn_background_agent_worker_with_paths(&paths, launch)
 }
 
@@ -431,10 +469,20 @@ pub async fn run_background_agent_worker(launch_path: PathBuf) -> std::io::Resul
         }
     });
 
-    let task_store = launch
-        .active_team_name
-        .as_deref()
-        .map(crate::tasks::TaskStore::open_team);
+    // Background workers run in their own process, so they need their own
+    // TaskStore handle to honour TaskUpdate/TaskDone/TaskList. In team mode
+    // that's the shared team store; otherwise it's the parent session's
+    // store (`~/.config/jfc/tasks/<session>.json`). Without the non-team
+    // branch, detached agents in a normal session got `None` and every
+    // task tool failed with "Task store not available".
+    let task_store = match (
+        launch.active_team_name.as_deref(),
+        launch.parent_session_id.as_deref(),
+    ) {
+        (Some(team), _) => Some(crate::tasks::TaskStore::open_team(team)),
+        (None, Some(session_id)) => Some(crate::tasks::TaskStore::open(session_id)),
+        (None, None) => None,
+    };
     let started = Instant::now();
     let result = crate::tools::execute_task(
         &launch.task_input,

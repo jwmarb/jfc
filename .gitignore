@@ -5,3 +5,7 @@ target/
 .env.*
 !.env.example
 .claude/worktrees/
+.jfc-worktrees/
+.sisyphus/
+dhat-heap.json
+profiling-results/

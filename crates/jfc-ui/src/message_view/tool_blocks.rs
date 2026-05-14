@@ -608,7 +608,8 @@ pub fn tool_kind_color(kind: &ToolKind, t: &Theme) -> ratatui::style::Color {
         | ToolKind::TaskUpdate
         | ToolKind::TaskList
         | ToolKind::TaskDone
-        | ToolKind::TaskGet => Color::Rgb(140, 220, 220), // teal
+        | ToolKind::TaskGet
+        | ToolKind::TaskValidate => Color::Rgb(140, 220, 220), // teal
         ToolKind::MemoryCreate | ToolKind::MemoryDelete => Color::Rgb(220, 220, 140), // olive
         ToolKind::TeamCreate
         | ToolKind::TeamDelete
@@ -626,6 +627,9 @@ pub fn tool_kind_color(kind: &ToolKind, t: &Theme) -> ratatui::style::Color {
         ToolKind::MultiEdit => Color::Rgb(160, 230, 170),
         ToolKind::AskUserQuestion => Color::Rgb(255, 200, 240),
         ToolKind::WebFetch | ToolKind::WebSearch => Color::Rgb(120, 200, 220),
+        // Server-side tools: cyan-teal to distinguish them from local WebSearch
+        ToolKind::ServerWebSearch => Color::Rgb(80, 210, 200),
+        ToolKind::ServerCodeExecution => Color::Rgb(200, 160, 80), // amber-gold
         ToolKind::Mcp(_) => Color::Rgb(190, 170, 240),
         ToolKind::CronCreate
         | ToolKind::CronList
@@ -638,6 +642,7 @@ pub fn tool_kind_color(kind: &ToolKind, t: &Theme) -> ratatui::style::Color {
             Color::Rgb(180, 220, 180)
         }
         ToolKind::NotebookRead | ToolKind::NotebookEdit => Color::Rgb(255, 170, 100),
+        ToolKind::ScratchpadRead | ToolKind::ScratchpadWrite => Color::Rgb(200, 200, 160), // warm grey
         ToolKind::Generic(_) => t.text_secondary,
         // Unknown tools render in a muted style — they're never
         // dispatched (permission layer denies them), so the row is

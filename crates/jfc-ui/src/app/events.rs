@@ -56,6 +56,10 @@ pub enum AppEvent {
     /// (provider doesn't support compaction, exhausted attempts) keep the
     /// suppression flag so we don't spam compact requests every tool batch.
     CompactionFailed(String, Option<usize>, bool),
+    /// System prompt token estimate from the most recent stream request.
+    /// Used by the CompactionDone handler to add overhead to the post-
+    /// compact approx_tokens gauge.
+    SystemPromptLen(usize),
     /// Submit a user prompt as if the user typed it and pressed Enter. Used
     /// internally by the pre-submit compaction gate to re-fire the user's
     /// original prompt once compaction has shrunk the context.
@@ -121,6 +125,24 @@ pub enum AppEvent {
         description: String,
         model_used: Option<String>,
         max_input_tokens: Option<u64>,
+        /// True iff this task is a detached background worker (run via
+        /// `spawn_background_agent_worker`). Detached workers register
+        /// themselves into the daemon roster from their own process with
+        /// the correct PID and launch_path — the UI must NOT overwrite
+        /// that record on TaskStarted. Foreground (in-process) teammates
+        /// and subagents have `is_detached = false`; for those the daemon
+        /// roster is only used as a passive log target, and the
+        /// reconciler later marks them stale when the UI exits.
+        ///
+        /// Default to `false` so legacy/test sites that omit the field
+        /// keep their previous behavior (foreground registration).
+        is_detached: bool,
+        /// Queued task id (`t<N>`) this delegation fulfils, if the model
+        /// linked the Task call to a todo via `parent_task_id`. The
+        /// `TaskStarted` handler flips that task to `in_progress`; the
+        /// matching `TaskCompleted`/`TaskFailed` handler flips it to
+        /// `completed`/`failed`. `None` for un-linked ad-hoc delegations.
+        parent_task_id: Option<String>,
     },
     TaskProgress {
         task_id: crate::ids::TaskId,
@@ -180,6 +202,14 @@ pub enum AppEvent {
         color: Option<String>,
         agent_type: Option<String>,
         cwd: String,
+        /// Abort handle returned by `swarm::runner::start_teammate`. The
+        /// event handler must move this into
+        /// `app.team_context.teammates[agent_id].abort_tx` so the channel
+        /// stays open for the teammate's lifetime. Dropping it closes the
+        /// channel and the runner's abort_rx.changed() resolves Err on the
+        /// next poll — which the runner treats as Cancelled, lighting up
+        /// every teammate as "Done" before doing any work.
+        abort_tx: Option<tokio::sync::watch::Sender<bool>>,
     },
     /// The model called `ExitPlanMode` and wants the user to see the
     /// plan + transition out of plan mode.
@@ -189,6 +219,14 @@ pub enum AppEvent {
     /// Model-callable plan-mode entry. Dispatched by the `EnterPlanMode`
     /// tool — flips `app.permission_mode` to `PermissionMode::Plan`.
     EnterPlanModeRequested {
+        reason: String,
+    },
+    /// Verdict from the `/goal` stop-condition evaluator. Emitted by a
+    /// background task spawned at EndTurn when `app.goal.is_some()`.
+    /// The event_loop handler decides whether to inject a continuation
+    /// reminder (`ok=false`) or stamp a success banner (`ok=true`).
+    GoalVerdict {
+        ok: bool,
         reason: String,
     },
 }

@@ -41,7 +41,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 arboard = { version = "3", default-features = false, features = ["wayland-data-control", "image-data"] }
 base64 = "0.22"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 serde_yaml = "0.9"
 toml = "0.8"
 dirs = "5"
@@ -81,19 +81,31 @@ notify = "8"
 # overkill for our needs but the binary already pulls regex through
 # `tracing-subscriber`'s env-filter, so this is essentially free.
 regex = "1"
+ignore = "0.4"
+indexmap = "2"
+url = "2"
+urlencoding = "2"
+serde_urlencoded = "0.7"
 jfc-graph = { path = "../jfc-graph" }
 jfc-economy = { path = "../jfc-economy" }
+
+# Optional profiling deps (enable via --features dhat-heap or --features profiling)
+dhat = { version = "0.3.3", optional = true }
+pprof = { version = "0.14", features = ["flamegraph", "criterion"], optional = true }
+console-subscriber = { version = "0.4", optional = true }
 
 [build-dependencies]
 syntect = { version = "5", default-features = false, features = ["default-syntaxes", "regex-onig", "yaml-load", "dump-create", "dump-load"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+divan = "0.1"
 proptest = "1"
+serial_test = "3"
 tempfile = "3.27.0"
 
 [features]
-default = ["hooks", "permission-automation", "anthropic-oauth-sensitive"]
+default = ["hooks", "permission-automation", "anthropic-oauth-sensitive", "intent-gate"]
 # Feature-gated Anthropic OAuth sensitive implementation (CCH, billing attestation,
 # OAuth PKCE client id, etc.). Public builds can disable this via
 # `--no-default-features --features hooks,permission-automation` or similar.
@@ -104,6 +116,8 @@ hooks = []
 background-agents = []
 intent-gate = []
 landlock-sandbox = []
+dhat-heap = ["dhat"]
+profiling = ["pprof", "console-subscriber"]
 
 [[bench]]
 name = "hooks"

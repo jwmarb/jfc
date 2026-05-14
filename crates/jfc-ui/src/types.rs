@@ -624,6 +624,14 @@ pub struct TaskInput {
     pub mode: Option<String>,
     /// Isolation mode: "worktree" creates a temp git worktree for the agent.
     pub isolation: Option<String>,
+    /// Queued-task id (`t<N>`) this delegation is fulfilling. When set, the
+    /// runtime auto-transitions that task in the `TaskStore`: InProgress on
+    /// spawn, Completed when the subagent succeeds, Failed when it errors.
+    /// Without it, a delegated agent could finish cleanly while its queued
+    /// todo stayed `in_progress` forever — the Task tool result, the
+    /// background-task UI row, and the persistent TaskStore were three
+    /// loosely-coupled systems with no structured link.
+    pub parent_task_id: Option<String>,
 }
 
 impl TaskInput {
@@ -703,6 +711,7 @@ pub enum ToolKind {
     TaskList,
     TaskDone,
     TaskGet,
+    TaskValidate,
     Task,
     Skill,
     ToolSearch,
@@ -751,6 +760,15 @@ pub enum ToolKind {
     ExitWorktree,
     NotebookRead,
     NotebookEdit,
+    ScratchpadRead,
+    ScratchpadWrite,
+    /// Anthropic server-side web search tool. The model invokes this as a
+    /// `server_tool_use` block; Anthropic executes it and returns results in
+    /// a subsequent `tool_result`. jfc renders but does not dispatch it.
+    ServerWebSearch,
+    /// Anthropic server-side code execution tool. Same server-side semantics
+    /// as `ServerWebSearch` — rendered for visibility but not locally dispatched.
+    ServerCodeExecution,
     /// Deliberately-named generic tool wrapping a string label —
     /// used by sample harnesses and code that constructs a ToolKind
     /// for a tool whose semantics we know but don't represent as a
@@ -827,6 +845,11 @@ pub enum ToolInput {
         description: String,
         active_form: Option<String>,
         blocked_by: Vec<String>,
+        acceptance_criteria: Option<String>,
+        verification_command: Option<String>,
+        risk: Option<String>,
+        parent_id: Option<String>,
+        kind: Option<String>,
     },
     TaskUpdate {
         task_id: String,
@@ -834,6 +857,11 @@ pub enum ToolInput {
         subject: Option<String>,
         description: Option<String>,
         owner: Option<String>,
+        acceptance_criteria: Option<String>,
+        verification_command: Option<String>,
+        risk: Option<String>,
+        parent_id: Option<String>,
+        kind: Option<String>,
     },
     TaskList {
         status_filter: Option<String>,
@@ -845,6 +873,7 @@ pub enum ToolInput {
     TaskGet {
         task_id: String,
     },
+    TaskValidate,
     Skill {
         name: String,
         args: Option<String>,
@@ -1019,6 +1048,13 @@ pub enum ToolInput {
         new_source: String,
         edit_mode: Option<String>,
     },
+    ScratchpadRead {
+        key: String,
+    },
+    ScratchpadWrite {
+        key: String,
+        value: String,
+    },
     Generic {
         summary: String,
     },
@@ -1137,7 +1173,7 @@ impl ToolOutput {
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "?".into());
                 let preview = if stdout.len() > 100 {
-                    format!("{}...", &stdout[..100])
+                    format!("{}...", &stdout[..stdout.floor_char_boundary(100)])
                 } else {
                     stdout.clone()
                 };
@@ -1204,6 +1240,23 @@ pub struct ChatMessage {
     /// usage block and totals input + cache_read + cache_write +
     /// output.
     pub usage: Option<ModelUsage>,
+    /// True when this user message is a placeholder for a queued
+    /// prompt that hasn't been drained yet. Queued prompts render in
+    /// the transcript so the user can see "I queued this", but they
+    /// MUST be filtered out of `build_provider_messages*` — otherwise
+    /// the agentic continuation that fires while the queue is filling
+    /// would send the queued user prompt to the provider as part of
+    /// the current turn, polluting the prompt and creating the
+    /// "context jumped after queueing a message" symptom. Set to
+    /// `false` after `drain_queued_prompts` promotes the message to a
+    /// real submission. Default `false` so existing call sites stay
+    /// correct; only the queueing path flips this.
+    pub queued: bool,
+    /// Prompt-local image/PDF attachments owned by this message.
+    /// Populated at submit time from `app.pasted_images` by matching
+    /// `[Image #N]` markers in the message text. Replaces the old
+    /// process-global queue for paste-originated images.
+    pub attachments: Vec<crate::attachments::Attachment>,
 }
 
 impl ChatMessage {
@@ -1216,6 +1269,25 @@ impl ChatMessage {
             cost_tier: None,
             elapsed: None,
             usage: None,
+            queued: false,
+            attachments: Vec::new(),
+        }
+    }
+
+    /// User message that's a placeholder for a queued prompt. Identical
+    /// to `user()` except `queued = true`, which `build_provider_messages*`
+    /// uses to skip the message until `drain_queued_prompts` promotes it.
+    pub fn user_queued(content: String) -> Self {
+        Self {
+            role: Role::User,
+            parts: vec![MessagePart::Text(content)],
+            agent_name: None,
+            model_name: None,
+            cost_tier: None,
+            elapsed: None,
+            usage: None,
+            queued: true,
+            attachments: Vec::new(),
         }
     }
 
@@ -1234,6 +1306,8 @@ impl ChatMessage {
             cost_tier: None,
             elapsed: None,
             usage: None,
+            queued: false,
+            attachments: Vec::new(),
         }
     }
 
@@ -1246,6 +1320,8 @@ impl ChatMessage {
             cost_tier: None,
             elapsed: None,
             usage: None,
+            queued: false,
+            attachments: Vec::new(),
         }
     }
 
@@ -1268,6 +1344,8 @@ impl ChatMessage {
             cost_tier: None,
             elapsed: None,
             usage: None,
+            queued: false,
+            attachments: Vec::new(),
         }
     }
 
@@ -1497,6 +1575,7 @@ impl ToolKind {
             "tasklist" => Self::TaskList,
             "taskdone" => Self::TaskDone,
             "taskget" => Self::TaskGet,
+            "taskvalidate" | "task_validate" => Self::TaskValidate,
             "task" => Self::Task,
             "skill" => Self::Skill,
             "toolsearch" | "toolsearchtool" => Self::ToolSearch,
@@ -1531,6 +1610,20 @@ impl ToolKind {
             "exitworktree" | "exit_worktree" => Self::ExitWorktree,
             "notebookread" | "notebook_read" => Self::NotebookRead,
             "notebookedit" | "notebook_edit" => Self::NotebookEdit,
+            "scratchpadread" | "scratchpad_read" => Self::ScratchpadRead,
+            "scratchpadwrite" | "scratchpad_write" => Self::ScratchpadWrite,
+            // Server-side tool invocations arrive with the "server_tool_use:"
+            // prefix injected in sse.rs translate(). Strip it and route to
+            // the server-side variant.
+            _ if name.starts_with("server_tool_use:") => {
+                let inner = &name["server_tool_use:".len()..];
+                let inner_norm = inner.to_ascii_lowercase().replace('_', "");
+                match inner_norm.as_str() {
+                    "websearch" | "websearchtool" => Self::ServerWebSearch,
+                    "codeexecution" => Self::ServerCodeExecution,
+                    _ => Self::Generic(name.to_owned()),
+                }
+            }
             // MCP-namespaced tools route to the Mcp variant. Goes last
             // so it doesn't shadow specific matches.
             _ if name.starts_with("mcp__") => Self::Mcp(name.to_owned()),
@@ -1564,6 +1657,7 @@ impl ToolKind {
             Self::TaskList => "TaskList",
             Self::TaskDone => "TaskDone",
             Self::TaskGet => "TaskGet",
+            Self::TaskValidate => "TaskValidate",
             Self::Task => "Task",
             Self::Skill => "Skill",
             Self::ToolSearch => "ToolSearch",
@@ -1599,6 +1693,10 @@ impl ToolKind {
             Self::ExitWorktree => "ExitWorktree",
             Self::NotebookRead => "NotebookRead",
             Self::NotebookEdit => "NotebookEdit",
+            Self::ScratchpadRead => "ScratchpadRead",
+            Self::ScratchpadWrite => "ScratchpadWrite",
+            Self::ServerWebSearch => "ServerWebSearch",
+            Self::ServerCodeExecution => "ServerCodeExecution",
             Self::Generic(name) => name.as_str(),
             // The advertised name is what the model sent us — surface it
             // verbatim so logs and the transcript identify which name we
@@ -1622,6 +1720,7 @@ impl ToolKind {
             Self::TaskList => "TaskList",
             Self::TaskDone => "TaskDone",
             Self::TaskGet => "TaskGet",
+            Self::TaskValidate => "TaskValidate",
             Self::Task => "Task",
             Self::Skill => "Skill",
             Self::ToolSearch => "ToolSearch",
@@ -1657,6 +1756,10 @@ impl ToolKind {
             Self::ExitWorktree => "ExitWorktree",
             Self::NotebookRead => "NotebookRead",
             Self::NotebookEdit => "NotebookEdit",
+            Self::ScratchpadRead => "ScratchpadRead",
+            Self::ScratchpadWrite => "ScratchpadWrite",
+            Self::ServerWebSearch => "server_tool_use:web_search",
+            Self::ServerCodeExecution => "server_tool_use:code_execution",
             Self::Generic(name) => name.as_str(),
             // Round-trip the advertised name on the wire so a session
             // resumed from disk re-parses to the same UnknownTool kind.
@@ -1723,6 +1826,7 @@ impl ToolInput {
             },
             Self::TaskDone { task_id } => format!("done: {task_id}"),
             Self::TaskGet { task_id } => format!("get: {task_id}"),
+            Self::TaskValidate => "validate task graph".into(),
             Self::Task(ti) => ti.summary(),
             Self::Skill { name, args } => match args.as_deref().filter(|s| !s.is_empty()) {
                 Some(a) => format!("{name}: {a}"),
@@ -1827,6 +1931,8 @@ impl ToolInput {
                 let mode = edit_mode.as_deref().unwrap_or("replace");
                 format!("notebook {mode} {path}#{cell_id}")
             }
+            Self::ScratchpadRead { key } => format!("scratchpad read: {key}"),
+            Self::ScratchpadWrite { key, .. } => format!("scratchpad write: {key}"),
             Self::Generic { summary } => summary.clone(),
         }
     }
@@ -1898,7 +2004,11 @@ impl ToolInput {
         let kind = ToolKind::from_name(tool_name);
         let needs_object = !matches!(
             kind,
-            ToolKind::Generic(_) | ToolKind::Mcp(_) | ToolKind::UnknownTool { .. }
+            ToolKind::Generic(_)
+                | ToolKind::Mcp(_)
+                | ToolKind::UnknownTool { .. }
+                | ToolKind::ServerWebSearch
+                | ToolKind::ServerCodeExecution
         );
         if needs_object && obj.is_none() {
             return Err(ToolInputError::InvalidShape {
@@ -1983,6 +2093,11 @@ impl ToolInput {
                     description,
                     active_form: opt_str_field("active_form"),
                     blocked_by,
+                    acceptance_criteria: opt_str_field("acceptance_criteria"),
+                    verification_command: opt_str_field("verification_command"),
+                    risk: opt_str_field("risk"),
+                    parent_id: opt_str_field("parent_id"),
+                    kind: opt_str_field("kind"),
                 }
             }
             ToolKind::TaskUpdate => Self::TaskUpdate {
@@ -1991,6 +2106,11 @@ impl ToolInput {
                 subject: opt_str_field("subject"),
                 description: opt_str_field("description"),
                 owner: opt_str_field("owner"),
+                acceptance_criteria: opt_str_field("acceptance_criteria"),
+                verification_command: opt_str_field("verification_command"),
+                risk: opt_str_field("risk"),
+                parent_id: opt_str_field("parent_id"),
+                kind: opt_str_field("kind"),
             },
             ToolKind::TaskList => Self::TaskList {
                 status_filter: opt_str_field("status_filter"),
@@ -2002,6 +2122,7 @@ impl ToolInput {
             ToolKind::TaskGet => Self::TaskGet {
                 task_id: req_str("task_id")?,
             },
+            ToolKind::TaskValidate => Self::TaskValidate,
             ToolKind::Task => Self::Task(TaskInput {
                 description: req_str("description")?,
                 prompt: req_str("prompt")?,
@@ -2013,6 +2134,7 @@ impl ToolInput {
                 team_name: opt_str_field("team_name"),
                 mode: opt_str_field("mode"),
                 isolation: opt_str_field("isolation"),
+                parent_task_id: opt_str_field("parent_task_id"),
             }),
             ToolKind::Skill => Self::Skill {
                 name: opt_str_field("name")
@@ -2206,6 +2328,32 @@ impl ToolInput {
                 new_source: req_str("new_source")?,
                 edit_mode: opt_str_field("edit_mode"),
             },
+            ToolKind::ScratchpadRead => Self::ScratchpadRead {
+                key: req_str("key")?,
+            },
+            ToolKind::ScratchpadWrite => Self::ScratchpadWrite {
+                key: req_str("key")?,
+                value: req_str("value")?,
+            },
+            // Server-side tools: store a human-readable summary of the input
+            // so the render layer can display query/params without dispatching.
+            ToolKind::ServerWebSearch => Self::Generic {
+                summary: obj
+                    .and_then(|m| m.get("query"))
+                    .and_then(|q| q.as_str())
+                    .map(|q| format!("🔍 {q}"))
+                    .unwrap_or_else(|| v.to_string()),
+            },
+            ToolKind::ServerCodeExecution => Self::Generic {
+                summary: obj
+                    .and_then(|m| m.get("code"))
+                    .and_then(|c| c.as_str())
+                    .map(|c| {
+                        let preview: String = c.chars().take(120).collect();
+                        format!("⚡ {preview}")
+                    })
+                    .unwrap_or_else(|| v.to_string()),
+            },
             ToolKind::Generic(_) => Self::Generic {
                 summary: v.to_string(),
             },
@@ -2304,6 +2452,11 @@ impl ToolInput {
                 description,
                 active_form,
                 blocked_by,
+                acceptance_criteria,
+                verification_command,
+                risk,
+                parent_id,
+                kind,
             } => {
                 let mut v = json!({ "subject": subject, "description": description });
                 if let Some(af) = active_form {
@@ -2311,6 +2464,21 @@ impl ToolInput {
                 }
                 if !blocked_by.is_empty() {
                     v["blocked_by"] = json!(blocked_by);
+                }
+                if let Some(ac) = acceptance_criteria {
+                    v["acceptance_criteria"] = json!(ac);
+                }
+                if let Some(vc) = verification_command {
+                    v["verification_command"] = json!(vc);
+                }
+                if let Some(r) = risk {
+                    v["risk"] = json!(r);
+                }
+                if let Some(pid) = parent_id {
+                    v["parent_id"] = json!(pid);
+                }
+                if let Some(k) = kind {
+                    v["kind"] = json!(k);
                 }
                 v
             }
@@ -2320,6 +2488,11 @@ impl ToolInput {
                 subject,
                 description,
                 owner,
+                acceptance_criteria,
+                verification_command,
+                risk,
+                parent_id,
+                kind,
             } => {
                 let mut v = json!({ "task_id": task_id });
                 if let Some(s) = status {
@@ -2333,6 +2506,21 @@ impl ToolInput {
                 }
                 if let Some(o) = owner {
                     v["owner"] = json!(o);
+                }
+                if let Some(ac) = acceptance_criteria {
+                    v["acceptance_criteria"] = json!(ac);
+                }
+                if let Some(vc) = verification_command {
+                    v["verification_command"] = json!(vc);
+                }
+                if let Some(r) = risk {
+                    v["risk"] = json!(r);
+                }
+                if let Some(pid) = parent_id {
+                    v["parent_id"] = json!(pid);
+                }
+                if let Some(k) = kind {
+                    v["kind"] = json!(k);
                 }
                 v
             }
@@ -2351,6 +2539,7 @@ impl ToolInput {
             }
             Self::TaskDone { task_id } => json!({ "task_id": task_id }),
             Self::TaskGet { task_id } => json!({ "task_id": task_id }),
+            Self::TaskValidate => json!({}),
             Self::Task(ti) => {
                 let mut v = json!({
                     "description": ti.description,
@@ -2365,6 +2554,9 @@ impl ToolInput {
                 }
                 if let Some(m) = &ti.model {
                     v["model"] = json!(m);
+                }
+                if let Some(p) = &ti.parent_task_id {
+                    v["parent_task_id"] = json!(p);
                 }
                 v
             }
@@ -2609,6 +2801,8 @@ impl ToolInput {
                 }
                 v
             }
+            Self::ScratchpadRead { key } => json!({ "key": key }),
+            Self::ScratchpadWrite { key, value } => json!({ "key": key, "value": value }),
             Self::Generic { summary } => match serde_json::from_str::<serde_json::Value>(summary) {
                 Ok(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
                 Ok(_non_object) => json!({ "input": summary }),
@@ -2941,6 +3135,7 @@ mod tests {
             team_name: None,
             mode: None,
             isolation: None,
+            parent_task_id: None,
         };
         assert!(fg.summary().contains("foreground"));
 
@@ -2964,6 +3159,7 @@ mod tests {
             team_name: None,
             mode: None,
             isolation: None,
+            parent_task_id: None,
         });
         let v = input.to_value();
         assert_eq!(v["description"], "research");
@@ -3505,6 +3701,7 @@ mod tests {
             team_name: None,
             mode: None,
             isolation: None,
+            parent_task_id: None,
         }
     }
 
@@ -4559,6 +4756,8 @@ mod tests {
             cost_tier: None,
             elapsed: None,
             usage: None,
+            queued: false,
+            attachments: Vec::new(),
         }];
         let err = validate_turn_invariants(&msgs).expect_err("empty user must fail");
         assert_eq!(
@@ -4625,6 +4824,8 @@ mod tests {
             cost_tier: None,
             elapsed: None,
             usage: None,
+            queued: false,
+            attachments: Vec::new(),
         }];
         let err = validate_turn_invariants(&msgs).expect_err("tool part on user role must fail");
         match err {

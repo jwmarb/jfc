@@ -1,7 +1,7 @@
 #![cfg(all(test, feature = "anthropic-oauth-sensitive"))]
 use super::assistant_parts::{find_tool_at, sanitize_terminal_text, truncate_str};
 use super::bash::{BashCmdKind, classify_bash_cmd};
-use super::core::{build_render_items, is_groupable, severity_rank};
+use super::core::{build_render_items_ctx, RenderCtx, is_groupable, severity_rank};
 use super::detection::{looks_like_difftastic_output, looks_like_git_diff_output};
 use super::output_style::path_color;
 use super::outputs::{
@@ -1462,6 +1462,7 @@ mod helper_tests {
 
     // --- tool_title_width_cap ----------------------------------------
 
+    #[serial_test::serial]
     #[test]
     fn tool_title_width_cap_default_is_100_normal() {
         // Without any env override, default is 100.
@@ -1471,6 +1472,7 @@ mod helper_tests {
         assert_eq!(tool_title_width_cap(), 100);
     }
 
+    #[serial_test::serial]
     #[test]
     fn tool_title_width_cap_rejects_too_small_robust() {
         // Values < 20 are rejected by `.filter(|n| *n >= 20)` → fallback to 100.
@@ -2216,7 +2218,8 @@ fatal: external diff died, stopping at crates/jfc-ui/src/agents.rs\n";
     // get one of these cases added; if the predictor diverges, the test
     // fails before the user sees a clipped scroll.
     fn renderer_total_height(app: &App, inner_w: usize) -> usize {
-        build_render_items(app, inner_w)
+        let ctx = RenderCtx::from_app(app);
+        build_render_items_ctx(&ctx, inner_w)
             .iter()
             .map(|i| i.height(inner_w))
             .sum()

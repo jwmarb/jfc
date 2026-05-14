@@ -185,6 +185,8 @@ pub enum SerializedToolInput {
         run_in_background: bool,
         #[serde(default)]
         model: Option<String>,
+        #[serde(default)]
+        parent_task_id: Option<String>,
     },
     TaskCreate {
         subject: String,
@@ -452,9 +454,10 @@ fn extract_first_prompt(messages: &[ChatMessage]) -> Option<String> {
             m.parts.iter().find_map(|p| match p {
                 MessagePart::Text(t) if !t.trim().is_empty() => {
                     let trimmed = t.trim();
-                    // Truncate long prompts for display
+                    // Truncate long prompts for display (floor to char boundary)
                     if trimmed.len() > 100 {
-                        Some(format!("{}…", &trimmed[..100]))
+                        let boundary = trimmed.floor_char_boundary(100);
+                        Some(format!("{}…", &trimmed[..boundary]))
                     } else {
                         Some(trimmed.to_string())
                     }
@@ -526,6 +529,11 @@ pub async fn save_session(
         .map(str::to_owned)
         .or_else(|| prior.as_ref().and_then(|s| s.model.clone()));
 
+    // Drop any queued-prompt placeholders before serializing. They're a
+    // runtime-only construct used to render "⏳ I queued this" in the
+    // transcript; persisting them would make resume re-display unsent
+    // prompts and (worse) `recompute_token_estimate` count their bytes
+    // against the context budget on the next launch.
     let serialized = SerializedSession {
         id: session_id_str.to_owned(),
         created_at,
@@ -534,7 +542,11 @@ pub async fn save_session(
         model: stored_model,
         cwd: stored_cwd,
         title,
-        messages: messages.iter().map(serialize_message).collect(),
+        messages: messages
+            .iter()
+            .filter(|m| !m.queued)
+            .map(serialize_message)
+            .collect(),
     };
 
     if let Ok(json) = serde_json::to_string_pretty(&serialized) {
@@ -624,7 +636,11 @@ pub async fn load_session_metadata(session_id: &SessionId) -> Option<SessionMeta
     let shallow: SessionMetaShallow = match serde_json::from_str(&content) {
         Ok(s) => s,
         Err(e) => {
-            warn!(target: "jfc::session", session_id = session_id_str, error = %e, "failed to parse session metadata");
+            // Downgrade to debug for schema-mismatch on old sessions — these are
+            // expected when the SerializedToolOutput format changed. The session
+            // remains in the sessions dir but is silently skipped in listings.
+            // A WARN flood of 20+ messages per startup was traced to May 4 sessions.
+            debug!(target: "jfc::session", session_id = session_id_str, error = %e, "skipping old session (schema mismatch — pre-migration format)");
             return None;
         }
     };
@@ -1090,12 +1106,14 @@ fn serialize_tool_input(input: &ToolInput) -> SerializedToolInput {
             category: ti.category.clone(),
             run_in_background: ti.run_in_background,
             model: ti.model.clone(),
+            parent_task_id: ti.parent_task_id.clone(),
         },
         ToolInput::TaskCreate {
             subject,
             description,
             active_form,
             blocked_by,
+            ..
         } => SerializedToolInput::TaskCreate {
             subject: subject.clone(),
             description: description.clone(),
@@ -1108,6 +1126,7 @@ fn serialize_tool_input(input: &ToolInput) -> SerializedToolInput {
             subject,
             description,
             owner,
+            ..
         } => SerializedToolInput::TaskUpdate {
             task_id: task_id.clone(),
             status: status.clone(),
@@ -1127,6 +1146,9 @@ fn serialize_tool_input(input: &ToolInput) -> SerializedToolInput {
         },
         ToolInput::TaskGet { task_id } => SerializedToolInput::TaskGet {
             task_id: task_id.clone(),
+        },
+        ToolInput::TaskValidate => SerializedToolInput::Generic {
+            summary: "TaskValidate".to_string(),
         },
         ToolInput::Skill { name, args } => SerializedToolInput::Skill {
             name: name.clone(),
@@ -1306,6 +1328,12 @@ fn serialize_tool_input(input: &ToolInput) -> SerializedToolInput {
                 edit_mode.as_deref().unwrap_or("replace"),
             ),
         },
+        ToolInput::ScratchpadRead { key } => SerializedToolInput::Generic {
+            summary: format!("ScratchpadRead: {key}"),
+        },
+        ToolInput::ScratchpadWrite { key, .. } => SerializedToolInput::Generic {
+            summary: format!("ScratchpadWrite: {key}"),
+        },
         ToolInput::Generic { summary } => SerializedToolInput::Generic {
             summary: summary.clone(),
         },
@@ -1390,6 +1418,13 @@ fn deserialize_message(msg: SerializedMessage) -> ChatMessage {
         cost_tier: msg.cost_tier,
         elapsed: msg.elapsed,
         usage: msg.usage,
+        // Queued is a runtime-only marker — resumed sessions never have
+        // unsent queued prompts because drain_queued_prompts runs as
+        // part of the turn lifecycle before save_session ever fires.
+        queued: false,
+        // Attachments (images) are not persisted in session files — they
+        // would bloat JSON to hundreds of MB. Default to empty on load.
+        attachments: Vec::new(),
     }
 }
 
@@ -1551,6 +1586,7 @@ fn deserialize_tool_input(input: SerializedToolInput) -> ToolInput {
             category,
             run_in_background,
             model,
+            parent_task_id,
         } => ToolInput::Task(TaskInput {
             description,
             prompt,
@@ -1562,6 +1598,7 @@ fn deserialize_tool_input(input: SerializedToolInput) -> ToolInput {
             team_name: None,
             mode: None,
             isolation: None,
+            parent_task_id,
         }),
         SerializedToolInput::TaskCreate {
             subject,
@@ -1573,6 +1610,11 @@ fn deserialize_tool_input(input: SerializedToolInput) -> ToolInput {
             description,
             active_form,
             blocked_by,
+            acceptance_criteria: None,
+            verification_command: None,
+            risk: None,
+            parent_id: None,
+            kind: None,
         },
         SerializedToolInput::TaskUpdate {
             task_id,
@@ -1586,6 +1628,11 @@ fn deserialize_tool_input(input: SerializedToolInput) -> ToolInput {
             subject,
             description,
             owner,
+            acceptance_criteria: None,
+            verification_command: None,
+            risk: None,
+            parent_id: None,
+            kind: None,
         },
         SerializedToolInput::TaskList {
             status_filter,

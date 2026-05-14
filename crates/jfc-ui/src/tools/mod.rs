@@ -38,12 +38,13 @@ use memory::{execute_memory_create, execute_memory_delete};
 use notebook::{execute_notebook_edit, execute_notebook_read};
 use notifications::{execute_push_notification, execute_remote_trigger};
 use search::{execute_glob, execute_grep};
+pub(crate) use swarm::{CURRENT_AGENT_NAME, current_agent_name};
 use swarm::{
     execute_send_message, execute_team_create, execute_team_delete, execute_team_member_mode,
 };
 use tasks::{
     execute_task_create, execute_task_done, execute_task_get, execute_task_list,
-    execute_task_update,
+    execute_task_update, execute_task_validate,
 };
 use worktree::{execute_enter_plan_mode, execute_enter_worktree, execute_exit_worktree};
 
@@ -269,40 +270,27 @@ pub(crate) fn snapshot_mcp_registry() -> Option<crate::mcp::McpRegistry> {
 /// block instead of being squashed into a base64 text blob the
 /// model can't usefully read.
 ///
-/// Drained by `stream::build_provider_messages_with_tool_results`
-/// just before serialization.
-fn pending_tool_attachments_handle()
--> &'static std::sync::Mutex<Vec<crate::attachments::Attachment>> {
-    static H: OnceLock<std::sync::Mutex<Vec<crate::attachments::Attachment>>> = OnceLock::new();
-    H.get_or_init(|| std::sync::Mutex::new(Vec::new()))
-}
-
-/// Stash an attachment for the next outgoing tool_result message.
-/// Called by tools (currently the Read tool when handed a `.pdf`)
-/// that need to surface a binary blob via Anthropic's `document` or
-/// `image` content block.
-pub(crate) fn push_pending_tool_attachment(att: crate::attachments::Attachment) {
-    if let Ok(mut g) = pending_tool_attachments_handle().lock() {
-        tracing::debug!(
-            target: "jfc::tools::attach",
-            kind = att.kind.mime_type(),
-            bytes = att.bytes.len(),
-            queued = g.len() + 1,
-            "queued attachment for next request"
-        );
-        g.push(att);
-    }
-}
-
-/// Drain every staged attachment. Called from
-/// `stream::build_provider_messages_with_tool_results` so the next
-/// request includes the attachments and the queue resets to empty.
-pub fn take_pending_tool_attachments() -> Vec<crate::attachments::Attachment> {
-    pending_tool_attachments_handle()
-        .lock()
-        .map(|mut g| std::mem::take(&mut *g))
-        .unwrap_or_default()
-}
+// Process-global attachment queue removed.
+//
+// Previously `push_pending_tool_attachment` / `take_pending_tool_attachments`
+// shuttled binary blobs (PDFs from Read, @-mention auto-attaches) through
+// a `static OnceLock<Mutex<Vec<Attachment>>>` and `build_provider_messages_with_tool_results`
+// drained it onto the most recent user message. That had three failure
+// modes:
+//   1. Concurrent streams (multiple agents / parallel turns) could steal
+//      each other's attachments — last writer wins on the global Mutex.
+//   2. Tool-result purity: the drain appended attachments to the most
+//      recent user message, which after a Read tool is the synthetic
+//      `tool_results` user message. Anthropic requires tool_result
+//      blocks to be the ONLY content in their user message.
+//   3. Reading the code required tracing through a side-effecting
+//      drain step instead of seeing data flow through `ExecutionResult`.
+//
+// Replacement: per-message ownership. `ExecutionResult` carries an
+// `attachments: Vec<Attachment>` field; the event-loop `ToolResult`
+// handler moves it onto the owning assistant message's `.attachments`
+// field; `build_provider_messages*` already serializes per-message
+// attachments. No global state, no cross-stream leaks.
 
 /// Drop the cached graph for `cwd` (or every cached graph when `cwd` is
 /// `None`). Called after writes so the next graph query re-parses the
@@ -360,6 +348,40 @@ fn auto_context_queue() -> &'static std::sync::Mutex<Vec<std::path::PathBuf>> {
     QUEUE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
+/// Process-global inter-agent scratchpad. A shared key-value store that
+/// subagents and teammates can read/write to coordinate findings without
+/// passing data through the parent model's context. Intentionally global
+/// (unlike the deleted attachment queue which was a bug) — scratchpad is
+/// designed for cross-agent communication.
+fn scratchpad() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static PAD: OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        OnceLock::new();
+    PAD.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn execute_scratchpad_read(key: &str) -> ExecutionResult {
+    match scratchpad().lock() {
+        Ok(map) => match map.get(key) {
+            Some(value) => ExecutionResult::success(value.clone()),
+            None => ExecutionResult::failure(format!(
+                "Key '{key}' not found in scratchpad. Available keys: {}",
+                map.keys().cloned().collect::<Vec<_>>().join(", ")
+            )),
+        },
+        Err(_) => ExecutionResult::failure("Scratchpad lock poisoned"),
+    }
+}
+
+fn execute_scratchpad_write(key: &str, value: &str) -> ExecutionResult {
+    match scratchpad().lock() {
+        Ok(mut map) => {
+            map.insert(key.to_string(), value.to_string());
+            ExecutionResult::success(format!("Written to scratchpad key '{key}' ({} bytes)", value.len()))
+        }
+        Err(_) => ExecutionResult::failure("Scratchpad lock poisoned"),
+    }
+}
+
 /// Record that `path` was edited. Called from the Edit / Write /
 /// symbol_edit tool handlers after a successful write. Cheap — just
 /// appends to a Vec under a Mutex. The actual graph query runs
@@ -372,6 +394,75 @@ pub(crate) fn record_edited_file(path: &std::path::Path) {
             q.push(canonical);
         }
     }
+}
+
+/// The sentinel marker appended to tool outputs when slop_guard finds issues.
+/// Used by the event loop to detect and aggregate findings across a batch.
+pub(crate) const SLOP_GUARD_MARKER: &str = "\n\n--- Slop Guard ---\n";
+
+/// Run the slop_guard checks on a file that was just written/edited.
+/// Returns the original result with findings appended on success,
+/// or the original result unchanged if slop_guard panics, times out
+/// (>2s), or finds nothing.
+async fn maybe_run_slop_guard(
+    mut result: ExecutionResult,
+    file_path: &Path,
+    file_content: &str,
+    cwd: &Path,
+) -> ExecutionResult {
+    use std::time::Duration;
+
+    // Non-blocking: if slop_guard panics or exceeds 2s, skip silently.
+    // We spawn into a task so panics become JoinErrors instead of unwinding
+    // the caller.
+    let path = file_path.to_path_buf();
+    let content = file_content.to_string();
+    let workspace = cwd.to_path_buf();
+
+    let handle = tokio::spawn(async move {
+        crate::slop_guard::run_all_checks(&path, &content, &workspace).await
+    });
+
+    let guard_result = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+    match guard_result {
+        Ok(Ok(report)) => {
+            tracing::debug!(
+                target: "jfc::slop_guard",
+                file = %file_path.display(),
+                has_findings = report.has_findings,
+                "slop_guard completed"
+            );
+            if report.has_findings {
+                let formatted = crate::slop_guard::format_report(&report);
+                tracing::debug!(
+                    target: "jfc::slop_guard",
+                    file = %file_path.display(),
+                    findings = %formatted,
+                    "slop_guard findings"
+                );
+                result.output.push_str(SLOP_GUARD_MARKER);
+                result.output.push_str(&formatted);
+            }
+        }
+        Ok(Err(_join_err)) => {
+            // Task panicked — skip silently.
+            tracing::debug!(
+                target: "jfc::slop_guard",
+                file = %file_path.display(),
+                "slop_guard panicked, skipping"
+            );
+        }
+        Err(_timeout) => {
+            tracing::debug!(
+                target: "jfc::slop_guard",
+                file = %file_path.display(),
+                "slop_guard timed out (>2s), skipping"
+            );
+        }
+    }
+
+    result
 }
 
 /// Drain the auto-context queue and render a single Graph Context
@@ -573,6 +664,15 @@ pub struct ExecutionResult {
     /// a colorized diff in the transcript instead of a flat
     /// "file updated successfully" string.
     pub diff: Option<crate::types::DiffView>,
+    /// Binary attachments produced by this tool (e.g. the PDF the
+    /// Read tool just loaded). The event-loop `ToolResult` handler
+    /// promotes these onto the owning assistant message's
+    /// `.attachments` field so the per-message ownership model carries
+    /// them to the provider. Replaces the previous
+    /// `push_pending_tool_attachment` global queue — per-message
+    /// ownership means cross-session/cross-stream leaks are impossible
+    /// by construction.
+    pub attachments: Vec<crate::attachments::Attachment>,
 }
 
 impl ExecutionResult {
@@ -583,6 +683,7 @@ impl ExecutionResult {
             diagnostics: Vec::new(),
             provenance: None,
             diff: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -594,6 +695,7 @@ impl ExecutionResult {
             outcome: ToolOutcome::Failed,
             provenance: None,
             diff: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -604,6 +706,15 @@ impl ExecutionResult {
 
     pub fn with_diff(mut self, diff: crate::types::DiffView) -> Self {
         self.diff = Some(diff);
+        self
+    }
+
+    /// Attach one or more binary attachments to this tool result.
+    /// The event-loop handler will move them onto the owning assistant
+    /// message at ToolResult time so they're serialized as
+    /// `ProviderContent::Attachment` blocks on the next request.
+    pub fn with_attachments(mut self, atts: Vec<crate::attachments::Attachment>) -> Self {
+        self.attachments = atts;
         self
     }
 
@@ -846,7 +957,17 @@ pub async fn execute_tool(
         }
     }
 
-    let task_store = match (active_team_name, &kind) {
+    // For task tools in team mode, prefer the caller-supplied store if
+    // one was passed (the UI keeps `app.task_store` pointing at the
+    // team's `tasks.json` once team mode is active, and the event-loop
+    // migration runs at TeammateSpawned). Only fall back to
+    // `TaskStore::open_team` when the caller didn't thread a store —
+    // e.g. the swarm runner's tool path. Without this guard, every
+    // concurrent task tool would `open_team` its own fresh
+    // `Arc<TaskStore>`, each with its own private `Mutex<TaskStoreInner>`,
+    // and last-write-wins on `tasks.json` would silently drop sibling
+    // task creates — the "unknown task id t35..t46" symptom.
+    let task_store = match (active_team_name, &kind, task_store.clone()) {
         (
             Some(team_name),
             ToolKind::TaskCreate
@@ -854,7 +975,9 @@ pub async fn execute_tool(
             | ToolKind::TaskList
             | ToolKind::TaskDone
             | ToolKind::TaskGet,
+            None,
         ) => Some(TaskStore::open_team(team_name)),
+        (_, _, Some(store)) => Some(store),
         _ => task_store,
     };
 
@@ -883,6 +1006,8 @@ pub async fn execute_tool(
                 // graph_query reflects the new file content.
                 invalidate_graph_session_cache(Some(&cwd));
                 record_edited_file(Path::new(&file_path));
+                // Slop guard: check the written content for quality issues.
+                return maybe_run_slop_guard(result, Path::new(&file_path), &content, &cwd).await;
             }
             result
         }
@@ -902,6 +1027,9 @@ pub async fn execute_tool(
                 }
                 invalidate_graph_session_cache(Some(&cwd));
                 record_edited_file(Path::new(&file_path));
+                // Slop guard: read the post-edit content and check for quality issues.
+                let post_content = tokio::fs::read_to_string(&file_path).await.unwrap_or_default();
+                return maybe_run_slop_guard(result, Path::new(&file_path), &post_content, &cwd).await;
             }
             result
         }
@@ -933,8 +1061,13 @@ pub async fn execute_tool(
                 description,
                 active_form,
                 blocked_by,
+                acceptance_criteria,
+                verification_command,
+                risk,
+                parent_id,
+                kind,
             },
-        ) => execute_task_create(task_store, subject, description, active_form, blocked_by),
+        ) => execute_task_create(task_store, subject, description, active_form, blocked_by, acceptance_criteria, verification_command, risk, parent_id, kind),
         (
             ToolKind::TaskUpdate,
             ToolInput::TaskUpdate {
@@ -943,8 +1076,13 @@ pub async fn execute_tool(
                 subject,
                 description,
                 owner,
+                acceptance_criteria,
+                verification_command,
+                risk,
+                parent_id,
+                kind,
             },
-        ) => execute_task_update(task_store, &task_id, status, subject, description, owner),
+        ) => execute_task_update(task_store, &task_id, status, subject, description, owner, acceptance_criteria, verification_command, risk, parent_id, kind),
         (
             ToolKind::TaskList,
             ToolInput::TaskList {
@@ -961,6 +1099,9 @@ pub async fn execute_tool(
         }
         (ToolKind::TaskGet, ToolInput::TaskGet { task_id }) => {
             execute_task_get(task_store, &task_id)
+        }
+        (ToolKind::TaskValidate, ToolInput::TaskValidate) => {
+            execute_task_validate(task_store)
         }
         (ToolKind::Task, ToolInput::Task(_)) => {
             ExecutionResult::failure("Task tool must be dispatched via the streaming executor")
@@ -1402,12 +1543,14 @@ pub async fn execute_tool(
             invalidate_graph_session_cache(Some(&cwd));
             record_edited_file(&entry.file_path);
 
-            ExecutionResult::success(format!(
+            let result = ExecutionResult::success(format!(
                 "Edited symbol '{}' in {}{}",
                 handle,
                 entry.file_path.display(),
                 cascade_summary
-            ))
+            ));
+            // Slop guard: check the new file content for quality issues.
+            maybe_run_slop_guard(result, &entry.file_path, &new_file, &cwd).await
         }
         (
             ToolKind::PostBounty,
@@ -1736,7 +1879,11 @@ pub async fn execute_tool(
                 bytes = content.len(),
                 "MultiEdit applied"
             );
-            ExecutionResult::success(format!("Applied {applied} edits to {file_path}."))
+            invalidate_graph_session_cache(Some(&cwd));
+            record_edited_file(Path::new(&file_path));
+            let result = ExecutionResult::success(format!("Applied {applied} edits to {file_path}."));
+            // Slop guard: check the final content for quality issues.
+            maybe_run_slop_guard(result, Path::new(&file_path), &content, &cwd).await
         }
         (
             ToolKind::AskUserQuestion,
@@ -1986,6 +2133,18 @@ pub async fn execute_tool(
                 edit_mode,
             },
         ) => execute_notebook_edit(&path, &cell_id, &new_source, edit_mode.as_deref()).await,
-        (kind, _) => ExecutionResult::failure(format!("Tool {:?} not yet implemented", kind)),
+        (ToolKind::ScratchpadRead, ToolInput::ScratchpadRead { key }) => {
+            execute_scratchpad_read(&key)
+        }
+        (ToolKind::ScratchpadWrite, ToolInput::ScratchpadWrite { key, value }) => {
+            execute_scratchpad_write(&key, &value)
+        }
+        (kind, input) => ExecutionResult::failure(format!(
+            "tool input mismatch: {kind:?} was paired with an incompatible \
+             ToolInput variant ({}). This is a routing bug — the tool's \
+             implementation exists but the parsed input didn't match its \
+             expected shape.",
+            input.summary()
+        )),
     }
 }

@@ -230,6 +230,7 @@ fn all_tool_defs_includes_every_canonical_tool_normal() {
 
 // Normal: repeated `get_or_build_graph_session` calls for the same cwd
 // return Arc clones (same pointer), so the graph is built once.
+#[serial_test::serial]
 #[test]
 fn graph_session_cache_reuses_same_session_normal() {
     // The fixtures dir under jfc-graph is a stable target.
@@ -246,6 +247,7 @@ fn graph_session_cache_reuses_same_session_normal() {
 // Robust: `invalidate_graph_session_cache` causes the next call to
 // build a fresh session (different Arc pointer).
 #[test]
+#[serial_test::serial]
 fn graph_session_cache_invalidate_drops_session_robust() {
     let fixtures = std::path::Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -1827,7 +1829,7 @@ async fn execute_grep_files_with_matches_mode_normal() {
 
 #[test]
 fn execute_task_create_without_store_fails_robust() {
-    let r = execute_task_create(None, "subj".into(), "desc".into(), None, vec![]);
+    let r = execute_task_create(None, "subj".into(), "desc".into(), None, vec![], None, None, None, None, None);
     assert!(r.is_error());
     assert!(r.output.contains("Task store not available"));
 }
@@ -1841,6 +1843,7 @@ fn execute_task_create_with_store_returns_task_json_normal() {
         "release v1".into(),
         None,
         vec![],
+        None, None, None, None, None,
     );
     assert!(!r.is_error(), "{:?}", r);
     // The output is the JSON of the created task — should mention the
@@ -1858,13 +1861,14 @@ fn execute_task_create_with_unknown_dependency_fails_robust() {
         "y".into(),
         None,
         vec!["t999".into()],
+        None, None, None, None, None,
     );
     assert!(r.is_error(), "{:?}", r);
 }
 
 #[test]
 fn execute_task_update_without_store_fails_robust() {
-    let r = execute_task_update(None, "t1", None, None, None, None);
+    let r = execute_task_update(None, "t1", None, None, None, None, None, None, None, None, None);
     assert!(r.is_error());
 }
 
@@ -1877,6 +1881,7 @@ fn execute_task_update_changes_status_normal() {
         "do alpha".into(),
         None,
         vec![],
+        None, None, None, None, None,
     );
     assert!(!create.is_error());
     // First-created task gets id `t1`.
@@ -1887,6 +1892,7 @@ fn execute_task_update_changes_status_normal() {
         None,
         None,
         None,
+        None, None, None, None, None,
     );
     assert!(!r.is_error(), "{}", r.output);
     assert!(r.output.contains("in_progress"), "{}", r.output);
@@ -1895,7 +1901,7 @@ fn execute_task_update_changes_status_normal() {
 #[test]
 fn execute_task_update_invalid_status_fails_robust() {
     let store = TaskStore::in_memory();
-    execute_task_create(Some(store.clone()), "x".into(), "y".into(), None, vec![]);
+    execute_task_create(Some(store.clone()), "x".into(), "y".into(), None, vec![], None, None, None, None, None);
     let r = execute_task_update(
         Some(store),
         "t1",
@@ -1903,6 +1909,7 @@ fn execute_task_update_invalid_status_fails_robust() {
         Some("renamed".into()),
         None,
         None,
+        None, None, None, None, None,
     );
     assert!(r.is_error(), "{}", r.output);
     assert!(r.output.contains("Invalid task status"), "{}", r.output);
@@ -1911,7 +1918,7 @@ fn execute_task_update_invalid_status_fails_robust() {
 #[test]
 fn execute_task_done_marks_completed_normal() {
     let store = TaskStore::in_memory();
-    execute_task_create(Some(store.clone()), "do".into(), "it".into(), None, vec![]);
+    execute_task_create(Some(store.clone()), "do".into(), "it".into(), None, vec![], None, None, None, None, None);
     let r = execute_task_done(Some(store), "t1");
     assert!(!r.is_error(), "{}", r.output);
     assert!(r.output.contains("completed"), "{}", r.output);
@@ -1939,6 +1946,7 @@ fn execute_task_list_returns_tasks_normal() {
         "first".into(),
         None,
         vec![],
+        None, None, None, None, None,
     );
     execute_task_create(
         Some(store.clone()),
@@ -1946,6 +1954,7 @@ fn execute_task_list_returns_tasks_normal() {
         "second".into(),
         None,
         vec![],
+        None, None, None, None, None,
     );
     let r = execute_task_list(Some(store), None, None);
     assert!(!r.is_error(), "{}", r.output);
@@ -1956,7 +1965,7 @@ fn execute_task_list_returns_tasks_normal() {
 #[test]
 fn execute_task_list_filters_by_owner_robust() {
     let store = TaskStore::in_memory();
-    execute_task_create(Some(store.clone()), "x".into(), "y".into(), None, vec![]);
+    execute_task_create(Some(store.clone()), "x".into(), "y".into(), None, vec![], None, None, None, None, None);
     execute_task_update(
         Some(store.clone()),
         "t1",
@@ -1964,6 +1973,7 @@ fn execute_task_list_filters_by_owner_robust() {
         None,
         None,
         Some("alice".into()),
+        None, None, None, None, None,
     );
     let only_alice = execute_task_list(Some(store.clone()), None, Some("alice"));
     assert!(only_alice.output.contains("alice"), "{}", only_alice.output);
@@ -2095,6 +2105,7 @@ async fn execute_tool_task_kind_rejects_with_streaming_message_robust() {
             team_name: None,
             mode: None,
             isolation: None,
+            parent_task_id: None,
         }),
         PathBuf::from("."),
         None,
@@ -2108,8 +2119,10 @@ async fn execute_tool_task_kind_rejects_with_streaming_message_robust() {
 
 #[tokio::test]
 async fn execute_tool_kind_input_mismatch_falls_through_robust() {
-    // Mismatched kind/input pair returns "not yet implemented" so a
-    // routing bug surfaces clearly rather than silently dropping.
+    // Mismatched kind/input pair returns a "tool input mismatch" routing
+    // error so the bug surfaces clearly rather than being mislabeled as
+    // an unimplemented tool — the implementation exists, the input shape
+    // is just wrong.
     let r = execute_tool(
         ToolKind::Bash,
         ToolInput::Generic {
@@ -2122,7 +2135,7 @@ async fn execute_tool_kind_input_mismatch_falls_through_robust() {
     )
     .await;
     assert!(r.is_error());
-    assert!(r.output.contains("not yet implemented"), "{}", r.output);
+    assert!(r.output.contains("tool input mismatch"), "{}", r.output);
 }
 
 #[tokio::test]
@@ -2221,6 +2234,11 @@ async fn execute_tool_dispatches_task_create_normal() {
             description: "test".into(),
             active_form: None,
             blocked_by: vec![],
+            acceptance_criteria: None,
+            verification_command: None,
+            risk: None,
+            parent_id: None,
+            kind: None,
         },
         PathBuf::from("."),
         None,
@@ -2322,6 +2340,7 @@ async fn lsp_rejects_relative_path_robust() {
 
 // ─── PushNotification tool ─────────────────────────────────────────────
 
+#[serial_test::serial]
 #[test]
 fn push_notification_normal() {
     // Disable the OS daemon so this never fires a real notification
@@ -2381,6 +2400,7 @@ description = "no url here"
 /// Normal: `execute_remote_trigger` POSTs to the configured URL using
 /// a tokio listener as the destination. We reach into a hand-written
 /// triggers.toml in a temp HOME so the production path resolves there.
+#[serial_test::serial]
 #[tokio::test]
 async fn execute_remote_trigger_posts_payload_normal() {
     use std::net::SocketAddr;
@@ -2442,6 +2462,7 @@ async fn execute_remote_trigger_posts_payload_normal() {
     );
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn execute_remote_trigger_unknown_id_fails_robust() {
     let home = tempfile::tempdir().expect("tempdir");
@@ -2543,8 +2564,26 @@ async fn enter_worktree_invalid_name_fails_robust() {
 /// than blindly invoking git.
 #[tokio::test]
 async fn enter_worktree_outside_repo_fails_robust() {
+    // Use a fresh directory that we *know* has no .git anywhere above.
+    // Previously this used tempfile::tempdir() which lands in /tmp —
+    // but /tmp/.git can exist (sandbox environments, stale test
+    // artifacts) making find_repo_root succeed and the test panic on
+    // "git worktree add" instead of the expected error path. Creating
+    // a nested subdir and verifying no .git exists at any level gives
+    // us a truly git-free path.
     let dir = tempfile::tempdir().expect("tempdir");
-    let r = execute_enter_worktree("ok", None, dir.path()).await;
+    let isolated = dir.path().join("no-git-here").join("nested");
+    std::fs::create_dir_all(&isolated).expect("mkdir");
+    // Double-check: if somehow .git exists above us, skip the test
+    // gracefully rather than producing a confusing failure message.
+    if super::worktree::find_repo_root(&isolated).is_some() {
+        eprintln!(
+            "SKIP: .git found above {} — cannot test outside-repo behavior in this environment",
+            isolated.display()
+        );
+        return;
+    }
+    let r = execute_enter_worktree("ok", None, &isolated).await;
     assert!(r.is_error());
     assert!(
         r.output.contains("not inside a git repository"),

@@ -30,6 +30,9 @@ pub enum SseEvent {
         delta: MessageDeltaData,
         #[serde(default)]
         usage: Option<MessageUsage>,
+        /// Present when Anthropic server-side context management is active.
+        #[serde(default)]
+        context_management: Option<ContextManagement>,
     },
     MessageStop,
     Ping,
@@ -83,6 +86,14 @@ pub enum ContentBlock {
         #[allow(dead_code)]
         input: Value,
     },
+    /// Anthropic server-side tool invocation (e.g. web_search, code_execution).
+    /// These are executed server-side; jfc renders them but does not dispatch
+    /// them locally. Shape mirrors `tool_use` but uses `server_tool_use` type.
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,6 +112,20 @@ pub struct MessageDeltaData {
     pub stop_reason: Option<String>,
 }
 
+/// Optional server-side context management metadata that Anthropic may attach
+/// to a `message_delta` event when it is managing the context window on behalf
+/// of the caller. The shape is deliberately left open (`Value`) so that new
+/// fields (e.g. `compacted`, `removed_tokens`) don't cause parse failures.
+#[derive(Debug, Deserialize)]
+pub struct ContextManagement {
+    /// True when Anthropic has already compacted earlier turns on the server.
+    #[serde(default)]
+    pub compacted: bool,
+    /// Number of tokens removed by server-side compaction, if reported.
+    #[serde(default)]
+    pub removed_tokens: Option<u32>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ErrorBody {
     pub message: String,
@@ -114,6 +139,15 @@ pub enum BlockState {
         accumulated: String,
     },
     ToolUse {
+        id: String,
+        name: String,
+        input: String,
+    },
+    /// Server-side tool invocation block (web_search, code_execution, etc.).
+    /// Input is pre-populated from the start block and emits a prefixed
+    /// ToolDone name so the rendering layer can distinguish server tools
+    /// from locally-dispatched ones.
+    ServerToolUse {
         id: String,
         name: String,
         input: String,
@@ -163,6 +197,21 @@ pub fn translate(
                     name,
                     input: String::new(),
                 },
+                ContentBlock::ServerToolUse { id, name, input } => {
+                    // Server-side tools send their full input in the start
+                    // block rather than streaming it via InputJsonDelta. We
+                    // pre-populate the input string so it's available at stop.
+                    let input_str = if input.is_null() {
+                        String::new()
+                    } else {
+                        input.to_string()
+                    };
+                    BlockState::ServerToolUse {
+                        id,
+                        name,
+                        input: input_str,
+                    }
+                }
             });
             None
         }
@@ -211,10 +260,46 @@ pub fn translate(
                     tool_use_id: id,
                     input_json: input,
                 }),
+                // Server-side tools emit a prefixed tool name so stream.rs
+                // can recognize them and skip local dispatch.
+                Some(BlockState::ServerToolUse { id, name, input }) => {
+                    tracing::info!(
+                        target: "jfc::provider::anthropic_sse",
+                        index,
+                        tool_name = %name,
+                        tool_use_id = %id,
+                        "server_tool_use block complete"
+                    );
+                    Some(StreamEvent::ToolDone {
+                        index,
+                        tool_name: format!("server_tool_use:{name}"),
+                        tool_use_id: id,
+                        input_json: input,
+                    })
+                }
                 None => None,
             }
         }
-        SseEvent::MessageDelta { delta, usage } => {
+        SseEvent::MessageDelta {
+            delta,
+            usage,
+            context_management,
+        } => {
+            // Log server-side context management metadata when present.
+            if let Some(ref cm) = context_management {
+                tracing::debug!(
+                    target: "jfc::stream",
+                    context_management = ?cm,
+                    "server-side context management active"
+                );
+                if cm.compacted {
+                    tracing::info!(
+                        target: "jfc::stream",
+                        removed_tokens = ?cm.removed_tokens,
+                        "server compacted context (context_management.compacted=true)"
+                    );
+                }
+            }
             *stop_reason = Some(parse_stop_reason(delta.stop_reason.as_deref()));
             usage.map(|usage| StreamEvent::Usage {
                 input_tokens: usage.input_tokens(),
@@ -380,6 +465,27 @@ pub fn into_event_stream(resp: reqwest::Response) -> EventStream {
                         tracing::debug!(target: "jfc::provider::anthropic_sse", "sse [DONE]");
                         return None;
                     }
+                    // `context_hint` is a special SSE event type (not a JSON
+                    // `type` field) that Anthropic sends when the model is
+                    // approaching its context limit. Mirrors v132 cli.js line
+                    // 471490: treat it the same as a prompt_too_long rejection
+                    // so the main loop fires auto-compaction.
+                    if ev.event == "context_hint"
+                        || ev.data.contains("\"context_hint\"")
+                    {
+                        tracing::info!(
+                            target: "jfc::provider::anthropic_sse",
+                            event = %ev.event,
+                            data = %&ev.data[..ev.data.len().min(200)],
+                            "context_hint received — signalling auto-compact"
+                        );
+                        return Some(Ok(StreamEvent::Error {
+                            message: format!(
+                                "auto-compact: context_hint from server ({})",
+                                &ev.data[..ev.data.len().min(120)]
+                            ),
+                        }));
+                    }
                     match serde_json::from_str::<SseEvent>(&ev.data) {
                         Ok(parsed) => {
                             log_parsed_event(&parsed);
@@ -424,6 +530,7 @@ fn log_parsed_event(event: &SseEvent) {
                 ContentBlock::Text { .. } => "text",
                 ContentBlock::Thinking { .. } => "thinking",
                 ContentBlock::ToolUse { .. } => "tool_use",
+                ContentBlock::ServerToolUse { .. } => "server_tool_use",
             };
             if let ContentBlock::ToolUse { id, name, .. } = content_block {
                 tracing::info!(
@@ -432,6 +539,14 @@ fn log_parsed_event(event: &SseEvent) {
                     tool_name = %name,
                     tool_use_id = %id,
                     "content_block_start tool_use"
+                );
+            } else if let ContentBlock::ServerToolUse { id, name, .. } = content_block {
+                tracing::info!(
+                    target: "jfc::provider::anthropic_sse",
+                    index,
+                    tool_name = %name,
+                    tool_use_id = %id,
+                    "content_block_start server_tool_use"
                 );
             } else {
                 tracing::debug!(
@@ -468,12 +583,17 @@ fn log_parsed_event(event: &SseEvent) {
                 "content_block_stop"
             );
         }
-        SseEvent::MessageDelta { delta, usage } => {
+        SseEvent::MessageDelta {
+            delta,
+            usage,
+            context_management,
+        } => {
             tracing::info!(
                 target: "jfc::provider::anthropic_sse",
                 stop_reason = ?delta.stop_reason,
                 input_tokens = usage.as_ref().map(MessageUsage::input_tokens),
                 output_tokens = usage.as_ref().map(MessageUsage::output_total),
+                has_context_management = context_management.is_some(),
                 "message_delta"
             );
         }
@@ -652,6 +772,7 @@ mod tests {
                     stop_reason: Some("end_turn".into()),
                 },
                 usage: None,
+                context_management: None,
             },
             &mut blocks,
             &mut sr,
@@ -986,5 +1107,101 @@ mod tests {
         let s = serde_json::Value::String("[1, 2, 3]".to_owned());
         let result = ensure_input_object(&s);
         assert_eq!(result, serde_json::json!({"value": [1, 2, 3]}));
+    }
+
+    // ─── server_tool_use tests ────────────────────────────────────────────────
+
+    #[test]
+    fn server_tool_use_content_block_parses() {
+        let json = r#"{"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srvtool_1","name":"web_search","input":{"query":"rust async"}}}"#;
+        let event: SseEvent = serde_json::from_str(json).expect("server_tool_use must parse");
+        assert!(matches!(
+            event,
+            SseEvent::ContentBlockStart {
+                content_block: ContentBlock::ServerToolUse { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn server_tool_use_block_emits_tool_done_with_prefix() {
+        let (mut blocks, mut sr) = empty_state();
+        translate(
+            SseEvent::ContentBlockStart {
+                index: 0,
+                content_block: ContentBlock::ServerToolUse {
+                    id: "srvtool_1".into(),
+                    name: "web_search".into(),
+                    input: serde_json::json!({"query": "rust async"}),
+                },
+            },
+            &mut blocks,
+            &mut sr,
+        );
+        // Server tools pre-populate input at start, not via deltas
+        assert!(matches!(blocks[0], Some(BlockState::ServerToolUse { .. })));
+
+        let out = translate(
+            SseEvent::ContentBlockStop { index: 0 },
+            &mut blocks,
+            &mut sr,
+        );
+        // ToolDone is emitted with "server_tool_use:" prefix so stream.rs
+        // can route to a non-dispatch path.
+        assert!(
+            matches!(out, Some(StreamEvent::ToolDone { ref tool_name, ref tool_use_id, .. })
+                if tool_name == "server_tool_use:web_search" && tool_use_id == "srvtool_1"),
+            "expected ToolDone with server_tool_use: prefix, got: {out:?}"
+        );
+        assert!(blocks[0].is_none());
+    }
+
+    #[test]
+    fn server_tool_use_null_input_produces_empty_string() {
+        let (mut blocks, mut sr) = empty_state();
+        translate(
+            SseEvent::ContentBlockStart {
+                index: 0,
+                content_block: ContentBlock::ServerToolUse {
+                    id: "srvtool_2".into(),
+                    name: "code_execution".into(),
+                    input: serde_json::Value::Null,
+                },
+            },
+            &mut blocks,
+            &mut sr,
+        );
+        if let Some(Some(BlockState::ServerToolUse { input, .. })) = blocks.get(0) {
+            assert!(input.is_empty(), "null input should become empty string");
+        } else {
+            panic!("expected ServerToolUse block state");
+        }
+    }
+
+    #[test]
+    fn server_tool_use_from_name_routes_to_server_variant() {
+        use crate::types::ToolKind;
+        assert!(
+            matches!(
+                ToolKind::from_name("server_tool_use:web_search"),
+                ToolKind::ServerWebSearch
+            ),
+            "server_tool_use:web_search should map to ServerWebSearch"
+        );
+        assert!(
+            matches!(
+                ToolKind::from_name("server_tool_use:code_execution"),
+                ToolKind::ServerCodeExecution
+            ),
+            "server_tool_use:code_execution should map to ServerCodeExecution"
+        );
+        assert!(
+            matches!(
+                ToolKind::from_name("server_tool_use:unknown_future_tool"),
+                ToolKind::Generic(_)
+            ),
+            "unknown server tool should fall through to Generic"
+        );
     }
 }

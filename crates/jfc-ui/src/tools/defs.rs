@@ -157,6 +157,28 @@ pub fn all_tool_defs() -> Vec<ToolDef> {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Task ids that must complete before this task can start"
+                    },
+                    "acceptance_criteria": {
+                        "type": "string",
+                        "description": "Mechanistic pass/fail criteria for verifying task completion (e.g. 'cargo test --lib foo passes')"
+                    },
+                    "verification_command": {
+                        "type": "string",
+                        "description": "Shell command to confirm done-ness (e.g. 'cargo test -p jfc-ui')"
+                    },
+                    "risk": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                        "description": "Risk level. High-risk tasks require user approval before auto-execution."
+                    },
+                    "parent_id": {
+                        "type": "string",
+                        "description": "Parent task id for hierarchical task trees"
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["milestone", "task", "check", "decision"],
+                        "description": "Task kind: milestone (grouping), task (work unit), check (verification), decision (requires input)"
                     }
                 },
                 "required": ["subject", "description"]
@@ -188,6 +210,28 @@ pub fn all_tool_defs() -> Vec<ToolDef> {
                     "owner": {
                         "type": "string",
                         "description": "Assign task to a teammate name"
+                    },
+                    "acceptance_criteria": {
+                        "type": "string",
+                        "description": "Mechanistic pass/fail criteria for verifying task completion"
+                    },
+                    "verification_command": {
+                        "type": "string",
+                        "description": "Shell command to confirm done-ness"
+                    },
+                    "risk": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                        "description": "Risk level"
+                    },
+                    "parent_id": {
+                        "type": "string",
+                        "description": "Parent task id for hierarchical task trees"
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["milestone", "task", "check", "decision"],
+                        "description": "Task kind"
                     }
                 },
                 "required": ["task_id"]
@@ -238,6 +282,18 @@ pub fn all_tool_defs() -> Vec<ToolDef> {
                     }
                 },
                 "required": ["task_id"]
+            }),
+        },
+        ToolDef {
+            name: "TaskValidate".into(),
+            description: "Validate the task graph for health issues. Returns a structured report \
+                identifying orphaned tasks, tasks blocked forever, tasks without verification \
+                criteria, duplicate subjects, and parallelization opportunities. Use after \
+                creating a batch of tasks to check plan soundness.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
             }),
         },
         ToolDef {
@@ -344,6 +400,10 @@ pub fn all_tool_defs() -> Vec<ToolDef> {
                         "type": "string",
                         "enum": ["worktree"],
                         "description": "Isolation mode. 'worktree' creates a temporary git worktree."
+                    },
+                    "parent_task_id": {
+                        "type": "string",
+                        "description": "Queued task id (e.g. 't3') this delegation fulfils. When set, the runtime auto-marks that task in_progress on spawn, completed on success, and failed on error — so you don't need a separate TaskUpdate/TaskDone call for the delegated work."
                     }
                 },
                 "required": ["description", "prompt", "run_in_background"]
@@ -1031,6 +1091,38 @@ pub fn all_tool_defs() -> Vec<ToolDef> {
                     }
                 },
                 "required": ["path", "cell_id", "new_source"]
+            }),
+        },
+        ToolDef {
+            name: "ScratchpadRead".into(),
+            description: "Read a value from the shared inter-agent scratchpad by key. Returns the value if set, or an error if the key doesn't exist. Use this to read findings left by sibling agents.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "The key to read from the scratchpad"
+                    }
+                },
+                "required": ["key"]
+            }),
+        },
+        ToolDef {
+            name: "ScratchpadWrite".into(),
+            description: "Write a key-value pair to the shared inter-agent scratchpad. Other agents (siblings, teammates) can read this value via ScratchpadRead. Use for sharing discovered facts, file paths, intermediate results.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "The key to write to the scratchpad"
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "The value to store"
+                    }
+                },
+                "required": ["key", "value"]
             }),
         },
     ]

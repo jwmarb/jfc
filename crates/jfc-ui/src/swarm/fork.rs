@@ -124,6 +124,8 @@ mod tests {
                 cost_tier: None,
                 elapsed: None,
                 usage: None,
+                queued: false,
+                attachments: Vec::new(),
             })
             .collect()
     }

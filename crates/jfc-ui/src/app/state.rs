@@ -1,4 +1,5 @@
 use std::{cell::RefCell, collections::HashMap, sync::Arc, time::Instant};
+use indexmap::IndexMap;
 
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -31,6 +32,12 @@ pub struct TranscriptSearch {
 pub struct QueuedPrompt {
     pub text: String,
     pub is_meta: bool,
+    /// Image/PDF attachments captured at queue time. If the user pasted
+    /// an image and then typed a prompt while another turn was already
+    /// streaming, the referenced `[Image #N]` attachments are extracted
+    /// from `app.pasted_images` and pinned to THIS prompt so they
+    /// attach atomically when `drain_queued_prompts` promotes the entry.
+    pub attachments: Vec<crate::attachments::Attachment>,
 }
 
 pub const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -52,7 +59,13 @@ pub struct BackgroundTask {
     pub summary: Option<String>,
     pub error: Option<String>,
     pub last_tool: Option<String>,
+    /// Raw string log (kept for daemon log compat and the collapse/expand UI).
     pub messages: Vec<String>,
+    /// Structured message history mirroring the main chat's Vec<ChatMessage>.
+    /// Populated from AgentChunk (assistant text), TaskProgress (tool activity),
+    /// and TaskCompleted/TaskFailed events. Used by the MessageView renderer to
+    /// give the task view the same visual fidelity as the main conversation.
+    pub chat_messages: Vec<crate::types::ChatMessage>,
     /// Cumulative tool invocations the subagent has made this run.
     /// Mirrors v131's `toolUseCount` (cli.2.1.131.beautified.js, `jOH()`).
     pub tool_use_count: u32,
@@ -78,6 +91,12 @@ pub struct BackgroundTask {
     /// Set once per task when the budget gets crossed so we don't fire
     /// the kill / toast multiple times.
     pub budget_killed: bool,
+    /// Queued task id (`t<N>`) this delegated agent fulfils, if linked via
+    /// the Task tool's `parent_task_id`. Captured on `TaskStarted` so the
+    /// `TaskCompleted`/`TaskFailed` handlers — which only receive a
+    /// `task_id` (the agent's run id, not the todo id) — can look up which
+    /// `TaskStore` entry to transition. `None` for un-linked delegations.
+    pub parent_task_id: Option<String>,
 }
 
 pub struct App {
@@ -388,6 +407,10 @@ pub struct App {
     /// Updated by the tool execution loop to show what an in_progress task is
     /// doing (e.g. "Running bash: cargo test", "Reading src/main.rs").
     pub task_activities: HashMap<TaskId, String>,
+    /// Plan verification gate: when true, the plan has already been verified
+    /// for the current batch of pending tasks. Reset to false whenever new
+    /// tasks are created via TaskCreate.
+    pub plan_verified_this_batch: bool,
     pub last_usage_input: u32,
     pub last_usage_output: u32,
     /// Auto-expiring toast queue. Pruned every `Tick`. Pushed via
@@ -468,6 +491,10 @@ pub struct App {
     /// CLAUDE.md / agents / settings edits and prepend a system-
     /// reminder on the next outbound prompt.
     pub last_file_watcher_seen: u64,
+    /// Last keybindings-watcher change-counter we observed. Tick handler
+    /// compares against `file_watcher::keybindings_change_counter()` to
+    /// detect `keybindings.toml` edits and hot-reload them.
+    pub last_keybindings_watcher_seen: u64,
     /// Message indices the user pinned via `/pin <idx>`. Compaction
     /// preserves pinned messages verbatim regardless of token pressure.
     /// Stored as indices into `messages` rather than a flag on
@@ -476,6 +503,10 @@ pub struct App {
     /// `/verbose` toggle: when true, tool blocks render expanded by
     /// default. When false (default), they preview to N lines.
     pub verbose_mode: bool,
+    /// `/fast` toggle — mirrors Claude Code v2.1.139's `/fast` command (Alt+O).
+    /// When true, the `fast-mode-2026-02-01` beta header is added to every
+    /// Anthropic API request, routing to the lower-latency inference path.
+    pub fast_mode: bool,
     /// Per-session FIFO of tool mutations the user can `/undo`. Each
     /// entry captures `(file_path, prev_content, op_label)` before the
     /// tool runs. Capped at 100 entries (the oldest gets dropped). New
@@ -492,7 +523,11 @@ pub struct App {
     /// warning shown. Prevents toast spam when the same threshold is
     /// crossed multiple times across re-renders.
     pub cost_budget_warned_at: u8,
-    pub background_tasks: HashMap<String, BackgroundTask>,
+    /// Insertion-ordered map of subagent background tasks. IndexMap preserves
+    /// the spawn order so tab cycling, footer tabs, and "jump to latest" all
+    /// operate on a stable, chronological ordering instead of random HashMap
+    /// iteration order.
+    pub background_tasks: IndexMap<String, BackgroundTask>,
     pub show_info_sidebar: bool,
     pub mcp_servers: Vec<crate::types::McpServerInfo>,
     pub lsp_servers: Vec<crate::types::LspServerInfo>,
@@ -510,6 +545,12 @@ pub struct App {
     /// counters for detached background workers. Throttled in the Tick
     /// handler so we don't hammer the JSON file every frame.
     pub last_detached_sync_at: Option<std::time::Instant>,
+    /// Cached `daemon-state.json` mtime from the last successful parse.
+    /// Used to skip the (potentially MB-sized) read+parse when the file
+    /// hasn't been touched by any background worker since last poll —
+    /// this is the primary CPU-burn fix for sessions with hundreds of
+    /// historical background agents accumulated in the state file.
+    pub last_detached_state_mtime: Option<std::time::SystemTime>,
     pub leader_key_active: bool,
     pub leader_key_timeout: Option<std::time::Instant>,
     pub viewing_task_id: Option<String>,
@@ -529,9 +570,20 @@ pub struct App {
     /// `.clear()`ed on every switch — entering a task with 121 hidden
     /// lines required pressing `o` again every time.
     pub viewing_task_expanded: std::collections::HashMap<String, std::collections::HashSet<usize>>,
-    /// Drained at submit time; future Ctrl+V handlers push here. Anthropic
-    /// content-block conversion happens at provider-message-build time.
-    pub pending_attachments: Vec<crate::attachments::Attachment>,
+    /// Per-prompt image staging. Each Ctrl+V / bracketed paste of an image
+    /// lands here with a unique `id`; the submit path matches `[Image #N]`
+    /// markers in the textarea and moves referenced entries onto the
+    /// submitted ChatMessage's `attachments` field. Replaces the old
+    /// `pending_attachments → push_pending_tool_attachment` global queue.
+    pub pasted_images: Vec<crate::attachments::PastedContent>,
+    /// Monotonically incrementing counter for paste IDs within a session.
+    pub image_counter: u32,
+    /// How many detached background agents transitioned to
+    /// Completed/Failed since the last user submit. Incremented by
+    /// `sync_detached_background_tasks_from_daemon`; drained to 0 and
+    /// surfaced as a system_reminder in `handle_submit` so the parent
+    /// model knows agent results are available in the transcript.
+    pub background_tasks_completed_since_last_turn: u32,
     /// Per-frame map of `(tool_id, screen_rect)` populated by the message
     /// renderer as each `ToolBlock` paints. The mouse handler reads this to
     /// translate a left-click into the tool whose body should expand —
@@ -583,10 +635,17 @@ pub struct App {
     /// future config-toml field. When false, the slash command surfaces
     /// a hint message instead of running.
     pub advisor_enabled: bool,
-    /// v137 `/goal <condition>` — session-scoped stop condition. When set,
-    /// the agent keeps working until this condition is met. `/goal clear`
-    /// removes it.
-    pub goal_condition: Option<String>,
+    /// v137 `/goal <condition>` — session-scoped stop condition. When
+    /// `Some`, the agentic loop will not let the agent settle on
+    /// `EndTurn` until the evaluator (see `crate::goal::evaluate`)
+    /// returns `ok=true`. The struct carries iteration counter +
+    /// set-at timestamp + last unmet reason so the UI can show
+    /// progress and the loop can refuse to spin forever.
+    pub goal: Option<crate::goal::ActiveGoal>,
+    /// True while a goal evaluator call is in flight. Prevents the
+    /// agentic loop from racing two evaluators against the same
+    /// EndTurn (which would double-charge tokens and could disagree).
+    pub goal_evaluator_in_flight: bool,
     /// Shared flag: true when the UI needs high-frequency ticks (animations,
     /// kinetic scroll, boot sweep). The tick task reads this to choose
     /// `ANIM_TICK_MS` vs `IDLE_TICK_MS`.
@@ -604,6 +663,11 @@ pub struct App {
     /// `Some(None)` = resolved, not in a git repo.
     /// `Some(Some(path))` = resolved git root directory.
     pub git_root: Option<Option<std::path::PathBuf>>,
+    /// Estimated token count of the system prompt from the last stream
+    /// request. Used by the compaction handler to add overhead to the
+    /// post-compact `approx_tokens` estimate (system prompt + tool defs
+    /// are invisible to the message-only local estimate).
+    pub last_system_prompt_len: Option<usize>,
 }
 
 impl App {
@@ -728,6 +792,7 @@ impl App {
             task_panel_selected: 0,
             task_panel_state: TableState::default().with_selected(Some(0)),
             task_activities: HashMap::new(),
+            plan_verified_this_batch: false,
             last_usage_input: 0,
             last_usage_output: 0,
             toasts: Vec::new(),
@@ -745,12 +810,14 @@ impl App {
             last_heartbeat_at: None,
             last_mcp_refresh_seen: 0,
             last_file_watcher_seen: 0,
+            last_keybindings_watcher_seen: 0,
             pinned_message_indices: std::collections::HashSet::new(),
             verbose_mode: false,
+            fast_mode: false,
             tool_undo_history: std::collections::VecDeque::new(),
             pending_marsh_chunks: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             cost_budget_warned_at: 0,
-            background_tasks: HashMap::new(),
+            background_tasks: IndexMap::new(),
             show_info_sidebar: true,
             mcp_servers: Vec::new(),
             lsp_servers: Vec::new(),
@@ -758,11 +825,14 @@ impl App {
             anthropic_account_snapshot: None,
             anthropic_snapshot_refreshed_at: None,
             last_detached_sync_at: None,
+            last_detached_state_mtime: None,
             leader_key_active: false,
             leader_key_timeout: None,
             viewing_task_id: None,
             viewing_task_expanded: std::collections::HashMap::new(),
-            pending_attachments: Vec::new(),
+            pasted_images: Vec::new(),
+            image_counter: 0,
+            background_tasks_completed_since_last_turn: 0,
             tool_hit_regions: RefCell::new(Vec::new()),
             render_cache: RefCell::new(RenderCache::new()),
             diff_stats_cache: RefCell::new(None),
@@ -781,13 +851,15 @@ impl App {
                 .ok()
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
-            goal_condition: None,
+            goal: None,
+            goal_evaluator_in_flight: false,
             wants_animation_frame: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             scroll_velocity: 0.0,
             last_scroll_tick: std::time::Instant::now(),
             last_prefetch_at: std::time::Instant::now() - std::time::Duration::from_secs(10),
             prefetch_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             git_root: None,
+            last_system_prompt_len: None,
         };
         // Open the task store with the real session id so tasks persist to disk.
         if let Some(ref sid) = app.current_session_id {

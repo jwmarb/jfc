@@ -180,7 +180,7 @@ impl VertexProvider {
             (
                 "claude-opus-4-5@20251101",
                 "Claude Opus 4.5 (Vertex)",
-                Some(200_000),
+                Some(1_000_000),
                 Some(64_000),
             ),
             (
@@ -284,7 +284,11 @@ impl Provider for VertexProvider {
             body["tools"] = super::sse::build_tools(&options.tools);
         }
         if options.adaptive_thinking {
-            body["thinking"] = json!({ "type": "adaptive" });
+            let mut thinking = json!({ "type": "adaptive" });
+            if let Some(display) = options.thinking_display.as_deref() {
+                thinking["display"] = json!(display);
+            }
+            body["thinking"] = thinking;
         } else if let Some(budget) = options.thinking_budget {
             body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
         }
@@ -493,6 +497,7 @@ mod tests {
     //
     // This test is platform-conditional: we use a `#!/bin/sh` shebang which
     // requires a Unix shell. CI on macOS/Linux runs it; Windows skips.
+    #[serial_test::serial]
     #[test]
     #[cfg(unix)]
     fn fetch_gcloud_token_shells_out_normal() {
@@ -537,6 +542,7 @@ mod tests {
 
     // Robust: when gcloud exits non-zero, fetch_gcloud_token surfaces stderr
     // so the user learns why (typically "Reauth required").
+    #[serial_test::serial]
     #[test]
     #[cfg(unix)]
     fn fetch_gcloud_token_failure_propagates_stderr_robust() {
