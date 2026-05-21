@@ -12,7 +12,7 @@ use crate::scheduler;
 use crate::types::{ToolCall, ToolInput};
 use jfc_provider::{ModelId, Provider};
 
-#[tracing::instrument(target = "jfc::stream", skip(tx, dedup, task_store, provider, model, teammate_event_tx), fields(n = tool_calls.len()))]
+#[tracing::instrument(target = "jfc::stream", skip(tx, dedup, task_store, provider, providers, model, teammate_event_tx), fields(n = tool_calls.len()))]
 pub(crate) fn dispatch_tools_batched(
     tool_calls: Vec<ToolCall>,
     tx: &mpsc::Sender<AppEvent>,
@@ -21,6 +21,7 @@ pub(crate) fn dispatch_tools_batched(
     active_team_name: Option<String>,
     current_session_id: Option<String>,
     provider: Arc<dyn Provider>,
+    providers: Vec<Arc<dyn Provider>>,
     model: ModelId,
     teammate_event_tx: mpsc::UnboundedSender<crate::swarm::runner::TeammateEvent>,
     // wg-async: tool batches can run for minutes (Bash, subagents). Hand
@@ -85,13 +86,13 @@ pub(crate) fn dispatch_tools_batched(
                 .subagent_type
                 .as_deref()
                 .and_then(|t| agents.iter().find(|a| a.name.eq_ignore_ascii_case(t)));
-            let teammate_model = match crate::tools::selected_subagent_model(
+            let resolved = match crate::tools::selected_subagent_model(
                 &task_input,
                 agent_def,
                 model.clone(),
                 provider.name(),
             ) {
-                Ok(model) => model,
+                Ok(resolved) => resolved,
                 Err(error) => {
                     let _ = tx_task.try_send(AppEvent::Tool(ToolEvent::Result {
                         tool_id: crate::ids::ToolId::from(task_id),
@@ -101,7 +102,24 @@ pub(crate) fn dispatch_tools_batched(
                     continue;
                 }
             };
+            let teammate_model = resolved.model;
             let teammate_model_name = teammate_model.as_str().to_string();
+
+            let resolved_provider = match crate::tools::resolve_subagent_provider(
+                resolved.target_provider.as_ref(),
+                &providers,
+                &provider,
+            ) {
+                Ok(p) => p,
+                Err(error) => {
+                    let _ = tx_task.try_send(AppEvent::Tool(ToolEvent::Result {
+                        tool_id: crate::ids::ToolId::from(task_id),
+                        result: crate::runtime::ExecutionResult::failure(error),
+                    }));
+                    done();
+                    continue;
+                }
+            };
 
             let config = crate::swarm::runner::TeammateRunnerConfig {
                 identity: crate::swarm::TeammateIdentity {
@@ -116,7 +134,8 @@ pub(crate) fn dispatch_tools_batched(
                 description: task_input.description.clone(),
                 model: Some(teammate_model_name.clone()),
                 agent_type: task_input.subagent_type.clone(),
-                provider: provider.clone(),
+                provider: resolved_provider,
+                providers: providers.clone(),
                 model_id: teammate_model,
                 system_prompt: None,
                 task_store: Some(jfc_session::TaskStore::open_team(&team_name)),
@@ -237,6 +256,7 @@ pub(crate) fn dispatch_tools_batched(
         // ─── Normal subagent path ────────────────────────────────────────
         let tx_task = tx.clone();
         let provider_task = provider.clone();
+        let providers_task = providers.clone();
         let model_task = model.clone();
         let task_id = tc.id.as_str().to_owned();
         let description = task_input.description.clone();
@@ -267,7 +287,7 @@ pub(crate) fn dispatch_tools_batched(
             provider.name(),
         )
         .ok()
-        .map(|model| model.as_str().to_string());
+        .map(|resolved| resolved.model.as_str().to_string());
         let max_input_tokens = agent_def.as_ref().and_then(|a| a.max_input_tokens);
         if agent_def.is_none()
             && let Some(t) = task_input.subagent_type.as_deref()
@@ -341,6 +361,7 @@ pub(crate) fn dispatch_tools_batched(
         }
 
         tokio::spawn(async move {
+            let providers_for_task = providers_task;
             // If isolation: "worktree", create a git worktree for this agent
             let worktree_info = if task_input.isolation.as_deref() == Some("worktree") {
                 let name = format!(
@@ -434,6 +455,7 @@ pub(crate) fn dispatch_tools_batched(
             let result = crate::tools::execute_task(
                 &task_input,
                 provider_task.as_ref(),
+                &providers_for_task,
                 model_task,
                 Some(&tx_task),
                 Some(&task_id),

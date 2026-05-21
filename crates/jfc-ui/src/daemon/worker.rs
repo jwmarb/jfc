@@ -488,6 +488,7 @@ pub async fn run_background_agent_worker(launch_path: PathBuf) -> std::io::Resul
     let result = crate::tools::execute_task(
         &launch.task_input,
         provider.as_ref(),
+        &provider_init.providers,
         launch.model.clone(),
         Some(&tx),
         Some(&launch.task_id),

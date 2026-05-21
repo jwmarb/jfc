@@ -212,6 +212,7 @@ pub(crate) async fn handle_classifier_decision(
                 .as_ref()
                 .map(|id| id.as_str().to_owned()),
             Arc::clone(&app.provider),
+            app.providers.clone(),
             app.model.clone(),
             app.teammate_event_tx.clone(),
             app.cancel_token.clone(),

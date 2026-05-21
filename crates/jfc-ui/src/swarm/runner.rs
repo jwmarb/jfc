@@ -49,6 +49,10 @@ pub struct TeammateRunnerConfig {
     pub agent_type: Option<String>,
     /// Provider for API calls. Shared with the leader.
     pub provider: std::sync::Arc<dyn jfc_provider::Provider>,
+    /// All available providers — used for cross-provider subagent dispatch
+    /// when this teammate spawns nested subagents.
+    #[allow(dead_code)]
+    pub providers: Vec<std::sync::Arc<dyn jfc_provider::Provider>>,
     /// Model ID to use for this teammate's API calls.
     pub model_id: jfc_provider::ModelId,
     /// System prompt additions (agent-specific + teammate addendum).

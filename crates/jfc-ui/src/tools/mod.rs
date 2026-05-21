@@ -42,7 +42,7 @@ pub(crate) use economy::market_report_string;
 pub(crate) use economy::{EconomyAgentInvoker, EconomySwarmProvider, apply_winning_solution};
 
 // subagent
-pub(crate) use subagent::{execute_task, selected_subagent_model};
+pub(crate) use subagent::{execute_task, resolve_subagent_provider, selected_subagent_model};
 
 // tasks / skills
 #[cfg(test)]

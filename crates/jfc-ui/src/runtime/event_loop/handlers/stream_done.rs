@@ -404,6 +404,7 @@ pub(crate) async fn handle_stream_done(
                 .as_ref()
                 .map(|id| id.as_str().to_owned()),
             std::sync::Arc::clone(&app.provider),
+            app.providers.clone(),
             app.model.clone(),
             app.teammate_event_tx.clone(),
             app.cancel_token.clone(),

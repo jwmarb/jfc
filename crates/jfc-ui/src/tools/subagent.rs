@@ -124,12 +124,22 @@ fn cached_agent_models() -> &'static std::collections::HashMap<String, crate::co
     CACHE.get_or_init(|| crate::config::load().agents)
 }
 
+/// Result of subagent model resolution. Contains the resolved model ID
+/// and optionally the target provider when cross-provider routing is needed.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedSubagentModel {
+    pub model: jfc_provider::ModelId,
+    /// When `Some`, the subagent targets a different provider than the parent.
+    /// The caller must resolve this provider from the available providers list.
+    pub target_provider: Option<jfc_provider::ProviderId>,
+}
+
 pub(crate) fn selected_subagent_model(
     task_input: &crate::types::TaskInput,
     agent_def: Option<&crate::agents::AgentDef>,
     parent_model: jfc_provider::ModelId,
     provider_name: &str,
-) -> Result<jfc_provider::ModelId, String> {
+) -> Result<ResolvedSubagentModel, String> {
     let config_model = task_input
         .subagent_type
         .as_deref()
@@ -146,26 +156,52 @@ pub(crate) fn selected_subagent_model(
         .or_else(|| agent_def.and_then(|a| a.model.clone()));
 
     let Some(raw) = raw else {
-        return Ok(parent_model);
+        return Ok(ResolvedSubagentModel { model: parent_model, target_provider: None });
     };
 
     if raw.eq_ignore_ascii_case("inherit") || raw.eq_ignore_ascii_case("parent") {
-        return Ok(parent_model);
+        return Ok(ResolvedSubagentModel { model: parent_model, target_provider: None });
     }
 
     let aliased = subagent_model_alias(&raw, provider_name);
     let spec = jfc_provider::ModelSpec::parse_lenient(&aliased)
         .map_err(|e| format!("invalid subagent model {raw:?}: {e}"))?;
 
-    if let Some(prefix) = spec.provider()
-        && prefix.as_str() != provider_name
-    {
-        return Err(format!(
-            "subagent model {aliased:?} targets provider {prefix}, but the active provider is {provider_name}; provider switching for subagents is not wired yet"
-        ));
-    }
+    let target_provider = spec
+        .provider()
+        .filter(|prefix| prefix.as_str() != provider_name)
+        .cloned();
 
-    Ok(spec.into_model())
+    Ok(ResolvedSubagentModel { model: spec.into_model(), target_provider })
+}
+
+/// Resolve the provider for a subagent given its target provider preference.
+///
+/// When `target_provider` is `None`, returns the fallback (parent provider).
+/// When `Some(id)`, looks up the provider in the available list by name.
+///
+/// Returns `Err` with a clear message listing available providers when the
+/// target provider is not configured.
+pub(crate) fn resolve_subagent_provider(
+    target_provider: Option<&jfc_provider::ProviderId>,
+    providers: &[std::sync::Arc<dyn jfc_provider::Provider>],
+    fallback: &std::sync::Arc<dyn jfc_provider::Provider>,
+) -> Result<std::sync::Arc<dyn jfc_provider::Provider>, String> {
+    let Some(target) = target_provider else {
+        return Ok(std::sync::Arc::clone(fallback));
+    };
+    providers
+        .iter()
+        .find(|p| p.name() == target.as_str())
+        .cloned()
+        .ok_or_else(|| {
+            let available: Vec<&str> = providers.iter().map(|p| p.name()).collect();
+            format!(
+                "subagent targets provider {:?} which is not configured; \
+                 available providers: {available:?}",
+                target.as_str(),
+            )
+        })
 }
 
 #[cfg(test)]
@@ -239,7 +275,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(model.as_str(), "bedrock-claude-4-5-haiku");
+        assert_eq!(model.model.as_str(), "bedrock-claude-4-5-haiku");
     }
 
     #[test]
@@ -256,7 +292,7 @@ mod tests {
         .unwrap();
 
         unsafe { std::env::remove_var("CLAUDE_CODE_SUBAGENT_MODEL") };
-        assert_eq!(model.as_str(), "bedrock-claude-4-5-haiku");
+        assert_eq!(model.model.as_str(), "bedrock-claude-4-5-haiku");
     }
 
     #[test]
@@ -272,7 +308,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(model.as_str(), "gpt-5-mini");
+        assert_eq!(model.model.as_str(), "gpt-5-mini");
     }
 
     #[test]
@@ -289,25 +325,117 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            model.as_str(),
+            model.model.as_str(),
             crate::providers::anthropic_models::ALIAS_HAIKU
         );
     }
 
     #[test]
-    fn selected_subagent_model_rejects_cross_provider_models() {
+    fn selected_subagent_model_allows_cross_provider_models() {
         let _guard = ENV_LOCK.lock().unwrap();
         unsafe { std::env::remove_var("CLAUDE_CODE_SUBAGENT_MODEL") };
 
-        let error = selected_subagent_model(
+        let resolved = selected_subagent_model(
             &task_input(Some("anthropic/claude-haiku-4-5")),
             None,
             jfc_provider::ModelId::new("bedrock-claude-4-6-opus"),
             "openwebui",
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.contains("provider switching for subagents is not wired yet"));
+        assert_eq!(resolved.model.as_str(), "claude-haiku-4-5");
+        assert_eq!(
+            resolved.target_provider.as_ref().map(|p| p.as_str()),
+            Some("anthropic")
+        );
+    }
+
+    fn bare_task_input(model: Option<&str>) -> crate::types::TaskInput {
+        crate::types::TaskInput {
+            description: "test".to_string(),
+            prompt: "test".to_string(),
+            subagent_type: None,
+            category: None,
+            run_in_background: false,
+            model: model.map(str::to_string),
+            name: None,
+            team_name: None,
+            mode: None,
+            isolation: None,
+            parent_task_id: None,
+        }
+    }
+
+    #[test]
+    fn selected_subagent_model_qualified_cross_provider_returns_target_provider() {
+        let result = {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            unsafe { std::env::remove_var("CLAUDE_CODE_SUBAGENT_MODEL") };
+            selected_subagent_model(
+                &bare_task_input(Some("openai/gpt-5")),
+                None,
+                jfc_provider::ModelId::new("claude-sonnet-4-6"),
+                "anthropic",
+            )
+        };
+        // This should succeed with target_provider = Some("openai") after Task 4
+        // Currently FAILS because cross-provider is rejected
+        let resolved = result.unwrap();
+        assert_eq!(resolved.model.as_str(), "gpt-5");
+        assert_eq!(
+            resolved.target_provider.as_ref().map(|p| p.as_str()),
+            Some("openai")
+        );
+    }
+
+    #[test]
+    fn selected_subagent_model_bare_spec_returns_none_target_provider() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("CLAUDE_CODE_SUBAGENT_MODEL") };
+
+        let parent = jfc_provider::ModelId::new("claude-sonnet-4-6");
+        let result = selected_subagent_model(
+            &bare_task_input(Some("haiku")),
+            None,
+            parent,
+            "anthropic",
+        );
+        let resolved = result.unwrap();
+        assert!(resolved.target_provider.is_none());
+    }
+
+    #[test]
+    fn selected_subagent_model_inherit_returns_none_target_provider() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("CLAUDE_CODE_SUBAGENT_MODEL") };
+
+        let parent = jfc_provider::ModelId::new("claude-sonnet-4-6");
+        let result = selected_subagent_model(
+            &bare_task_input(Some("inherit")),
+            None,
+            parent.clone(),
+            "anthropic",
+        );
+        let resolved = result.unwrap();
+        assert_eq!(resolved.model, parent);
+        assert!(resolved.target_provider.is_none());
+    }
+
+    #[test]
+    fn selected_subagent_model_same_provider_qualified_returns_none_target() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("CLAUDE_CODE_SUBAGENT_MODEL") };
+
+        let parent = jfc_provider::ModelId::new("claude-sonnet-4-6");
+        let result = selected_subagent_model(
+            &bare_task_input(Some("anthropic/claude-haiku-4-5")),
+            None,
+            parent,
+            "anthropic",
+        );
+        let resolved = result.unwrap();
+        assert_eq!(resolved.model.as_str(), "claude-haiku-4-5");
+        assert!(resolved.target_provider.is_none());
     }
 
     struct ScriptedProvider {
@@ -376,6 +504,7 @@ mod tests {
         let result = execute_task(
             &task_input(None),
             &provider,
+            &[],
             jfc_provider::ModelId::new("claude-opus-4-7"),
             None,
             None,
@@ -394,6 +523,170 @@ mod tests {
         assert_eq!(result.output, "recovered");
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     }
+
+    #[test]
+    fn resolve_subagent_provider_routes_to_correct_provider() {
+        use std::sync::Arc;
+
+        struct NamedProvider(&'static str);
+
+        #[async_trait::async_trait]
+        impl jfc_provider::Provider for NamedProvider {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn available_models(&self) -> Vec<jfc_provider::ModelInfo> {
+                vec![]
+            }
+            async fn stream(
+                &self,
+                _messages: Vec<jfc_provider::ProviderMessage>,
+                _options: &jfc_provider::StreamOptions,
+            ) -> anyhow::Result<jfc_provider::EventStream> {
+                unimplemented!()
+            }
+        }
+        impl jfc_provider::seal::Sealed for NamedProvider {}
+
+        let anthropic: Arc<dyn jfc_provider::Provider> = Arc::new(NamedProvider("anthropic"));
+        let openai: Arc<dyn jfc_provider::Provider> = Arc::new(NamedProvider("openai"));
+        let providers: Vec<Arc<dyn jfc_provider::Provider>> =
+            vec![anthropic.clone(), openai.clone()];
+
+        // target = "openai" → should return the openai provider
+        let target = jfc_provider::ProviderId::new("openai");
+        let result = resolve_subagent_provider(Some(&target), &providers, &anthropic).unwrap();
+        assert_eq!(result.name(), "openai");
+
+        // target = None → should return the fallback (anthropic)
+        let result = resolve_subagent_provider(None, &providers, &anthropic).unwrap();
+        assert_eq!(result.name(), "anthropic");
+    }
+
+    #[test]
+    fn resolve_subagent_provider_missing_provider_returns_error() {
+        use std::sync::Arc;
+
+        struct NamedProvider(&'static str);
+
+        #[async_trait::async_trait]
+        impl jfc_provider::Provider for NamedProvider {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn available_models(&self) -> Vec<jfc_provider::ModelInfo> {
+                vec![]
+            }
+            async fn stream(
+                &self,
+                _messages: Vec<jfc_provider::ProviderMessage>,
+                _options: &jfc_provider::StreamOptions,
+            ) -> anyhow::Result<jfc_provider::EventStream> {
+                unimplemented!()
+            }
+        }
+        impl jfc_provider::seal::Sealed for NamedProvider {}
+
+        let anthropic: Arc<dyn jfc_provider::Provider> = Arc::new(NamedProvider("anthropic"));
+        let providers: Vec<Arc<dyn jfc_provider::Provider>> = vec![anthropic.clone()];
+
+        let target = jfc_provider::ProviderId::new("nonexistent");
+        let result = resolve_subagent_provider(Some(&target), &providers, &anthropic);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err but got Ok"),
+        };
+        assert!(err.contains("not configured"), "error was: {err}");
+        assert!(err.contains("anthropic"), "error was: {err}");
+    }
+
+    #[test]
+    fn selected_subagent_model_env_override_cross_provider() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("CLAUDE_CODE_SUBAGENT_MODEL", "litellm/deepseek-r1") };
+
+        let result = selected_subagent_model(
+            &bare_task_input(None),
+            None,
+            jfc_provider::ModelId::new("claude-sonnet-4-6"),
+            "anthropic",
+        );
+
+        unsafe { std::env::remove_var("CLAUDE_CODE_SUBAGENT_MODEL") };
+
+        let resolved = result.unwrap();
+        assert_eq!(resolved.model.as_str(), "deepseek-r1");
+        assert_eq!(
+            resolved.target_provider.as_ref().map(|p| p.as_str()),
+            Some("litellm")
+        );
+    }
+
+    #[test]
+    fn selected_subagent_model_bare_alias_on_openai_maps_correctly() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("CLAUDE_CODE_SUBAGENT_MODEL") };
+
+        let result = selected_subagent_model(
+            &bare_task_input(Some("haiku")),
+            None,
+            jfc_provider::ModelId::new("gpt-5"),
+            "openai",
+        );
+        let resolved = result.unwrap();
+        // "haiku" alias on openai maps to "gpt-5-mini", stays same provider
+        assert_eq!(resolved.model.as_str(), "gpt-5-mini");
+        assert!(resolved.target_provider.is_none());
+    }
+
+    #[test]
+    fn resolve_subagent_provider_none_target_returns_fallback() {
+        use std::sync::Arc;
+
+        struct NamedProvider(&'static str);
+
+        #[async_trait::async_trait]
+        impl jfc_provider::Provider for NamedProvider {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn available_models(&self) -> Vec<jfc_provider::ModelInfo> {
+                vec![]
+            }
+            async fn stream(
+                &self,
+                _messages: Vec<jfc_provider::ProviderMessage>,
+                _options: &jfc_provider::StreamOptions,
+            ) -> anyhow::Result<jfc_provider::EventStream> {
+                unimplemented!()
+            }
+        }
+        impl jfc_provider::seal::Sealed for NamedProvider {}
+
+        let anthropic: Arc<dyn jfc_provider::Provider> = Arc::new(NamedProvider("anthropic"));
+        let openai: Arc<dyn jfc_provider::Provider> = Arc::new(NamedProvider("openai"));
+        let providers: Vec<Arc<dyn jfc_provider::Provider>> =
+            vec![anthropic.clone(), openai.clone()];
+
+        let result = resolve_subagent_provider(None, &providers, &anthropic).unwrap();
+        assert_eq!(result.name(), "anthropic");
+    }
+
+    #[test]
+    fn selected_subagent_model_parent_keyword_returns_parent_no_cross() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("CLAUDE_CODE_SUBAGENT_MODEL") };
+
+        let result = selected_subagent_model(
+            &bare_task_input(Some("parent")),
+            None,
+            jfc_provider::ModelId::new("gpt-5"),
+            "openai",
+        );
+        let resolved = result.unwrap();
+        assert_eq!(resolved.model.as_str(), "gpt-5");
+        assert!(resolved.target_provider.is_none());
+    }
 }
 
 /// Run a subagent. The agent gets its own system prompt, tool catalogue
@@ -409,6 +702,7 @@ mod tests {
 pub async fn execute_task(
     task_input: &crate::types::TaskInput,
     provider: &dyn jfc_provider::Provider,
+    providers: &[std::sync::Arc<dyn jfc_provider::Provider>],
     model_id: jfc_provider::ModelId,
     tx: Option<&tokio::sync::mpsc::Sender<crate::runtime::AppEvent>>,
     task_id: Option<&str>,
@@ -420,6 +714,7 @@ pub async fn execute_task(
     execute_task_inner(
         task_input,
         provider,
+        providers,
         model_id,
         tx,
         task_id,
@@ -436,6 +731,7 @@ pub async fn execute_task(
 async fn execute_task_inner(
     task_input: &crate::types::TaskInput,
     provider: &dyn jfc_provider::Provider,
+    providers: &[std::sync::Arc<dyn jfc_provider::Provider>],
     model_id: jfc_provider::ModelId,
     tx: Option<&tokio::sync::mpsc::Sender<crate::runtime::AppEvent>>,
     task_id: Option<&str>,
@@ -450,12 +746,45 @@ async fn execute_task_inner(
         ProviderContent, ProviderMessage, ProviderRole, StopReason, StreamEvent, StreamOptions,
     };
 
-    let model = match selected_subagent_model(task_input, agent_def, model_id, provider.name()) {
-        Ok(model) => model,
+    let resolved = match selected_subagent_model(task_input, agent_def, model_id, provider.name()) {
+        Ok(resolved) => resolved,
         Err(error) => {
             return ExecutionResult::failure(error);
         }
     };
+    let model = resolved.model;
+
+    // Cross-provider dispatch: when the resolved model targets a different
+    // provider, look it up from the available providers slice.
+    let cross_provider_arc;
+    let effective_provider: &dyn jfc_provider::Provider =
+        if let Some(ref target) = resolved.target_provider {
+            match providers
+                .iter()
+                .find(|p| p.name() == target.as_str())
+            {
+                Some(found) => {
+                    cross_provider_arc = found.clone();
+                    tracing::info!(
+                        target: "jfc::tools",
+                        parent_provider = %provider.name(),
+                        target_provider = %target.as_str(),
+                        model = %model,
+                        "cross-provider subagent dispatch"
+                    );
+                    cross_provider_arc.as_ref()
+                }
+                None => {
+                    let available: Vec<&str> = providers.iter().map(|p| p.name()).collect();
+                    return ExecutionResult::failure(format!(
+                        "subagent targets provider {:?} which is not configured; available: {available:?}",
+                        target.as_str()
+                    ));
+                }
+            }
+        } else {
+            provider
+        };
 
     let cwd = cwd_override
         .clone()
@@ -576,7 +905,7 @@ async fn execute_task_inner(
         // 1M-token cap (the original 8.85M-token 400).
         let compacted = crate::stream::auto_compact_subagent_history(
             &mut conversation,
-            provider,
+            effective_provider,
             model.clone(),
         )
         .await;
@@ -607,7 +936,7 @@ async fn execute_task_inner(
         let mut stream_retry_attempt = 0u32;
         let (turn_text, tool_uses, stop_reason) = loop {
             let stream = match crate::stream::open_stream_with_bedrock_retries(
-                provider,
+                effective_provider,
                 std::sync::Arc::new(conversation.clone()),
                 &options,
             )
@@ -890,6 +1219,7 @@ async fn execute_task_inner(
                     Box::pin(execute_task_inner(
                         nested_task,
                         provider,
+                        providers,
                         model.clone(),
                         None,
                         None,

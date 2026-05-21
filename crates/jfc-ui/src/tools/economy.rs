@@ -343,6 +343,7 @@ impl jfc_economy::reporting::AgentInvoker for EconomyAgentInvoker {
         let result = super::subagent::execute_task(
             &task_input,
             self.provider.as_ref(),
+            &[],
             self.model.clone(),
             self.event_tx.as_ref(),
             Some(&task_id),
