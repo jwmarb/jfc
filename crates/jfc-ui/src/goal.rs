@@ -18,10 +18,10 @@
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-use crate::provider::{
+use crate::types::{ChatMessage, MessagePart, Role};
+use jfc_provider::{
     ModelId, Provider, ProviderContent, ProviderMessage, ProviderRole, StreamOptions,
 };
-use crate::types::{ChatMessage, MessagePart, Role};
 
 /// Hard cap on the condition body to mirror Claude Code's 4000-char ceiling.
 /// Prevents the user from accidentally pasting a 100KB prompt and
@@ -179,9 +179,7 @@ fn render_part_into(part: &MessagePart, out: &mut String) {
             // and it passed" without scrolling thousands of bytes.
             let output_preview = match &tc.output {
                 crate::types::ToolOutput::Text(t) => truncate(t, 400),
-                crate::types::ToolOutput::LargeText(lt) => {
-                    truncate(&lt.content, 400)
-                }
+                crate::types::ToolOutput::LargeText(lt) => truncate(&lt.content, 400),
                 crate::types::ToolOutput::Diff(_) => "[diff]".to_owned(),
                 crate::types::ToolOutput::FileContent { path, .. } => {
                     format!("[file: {path}]")
@@ -190,11 +188,21 @@ fn render_part_into(part: &MessagePart, out: &mut String) {
                     stdout, exit_code, ..
                 } => format!(
                     "[exit={}] {}",
-                    exit_code.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+                    exit_code
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "?".into()),
                     truncate(stdout, 300)
                 ),
                 crate::types::ToolOutput::FileList(v) => {
                     format!("[{} entries]", v.len())
+                }
+                crate::types::ToolOutput::ServerToolResult { tool_kind, content } => {
+                    let preview = serde_json::to_string(content).unwrap_or_default();
+                    format!(
+                        "[{wire}] {}",
+                        truncate(&preview, 400),
+                        wire = tool_kind.wire_type()
+                    )
                 }
                 crate::types::ToolOutput::Empty => String::new(),
             };
@@ -217,6 +225,8 @@ fn render_part_into(part: &MessagePart, out: &mut String) {
         }
         // Compaction marker — irrelevant for the evaluator's verdict.
         MessagePart::CompactBoundary { .. } => {}
+        // Redacted thinking is opaque; nothing to render.
+        MessagePart::RedactedThinking(_) => {}
     }
 }
 
@@ -267,9 +277,7 @@ pub async fn evaluate(
     history: &[ChatMessage],
 ) -> Result<GoalVerdict> {
     let snapshot = render_snapshot(history);
-    let user_body = format!(
-        "Transcript:\n{snapshot}\n\nCondition to verify:\n{condition}"
-    );
+    let user_body = format!("Transcript:\n{snapshot}\n\nCondition to verify:\n{condition}");
     let messages = vec![ProviderMessage {
         role: ProviderRole::User,
         content: vec![ProviderContent::Text(user_body)],
@@ -297,14 +305,17 @@ pub fn parse_verdict(reply: &str) -> Result<GoalVerdict> {
             reason: "evaluator returned empty reply".to_owned(),
         });
     }
-    if let Some(json) = extract_first_json_object(trimmed) {
-        if let Ok(v) = serde_json::from_str::<GoalVerdict>(&json) {
-            return Ok(v);
-        }
+    if let Some(json) = extract_first_json_object(trimmed)
+        && let Ok(v) = serde_json::from_str::<GoalVerdict>(&json)
+    {
+        return Ok(v);
     }
     Ok(GoalVerdict {
         ok: false,
-        reason: format!("evaluator reply was not parseable JSON: {}", truncate(trimmed, 200)),
+        reason: format!(
+            "evaluator reply was not parseable JSON: {}",
+            truncate(trimmed, 200)
+        ),
     })
 }
 
@@ -533,7 +544,8 @@ mod tests {
     // because we extract the first balanced `{...}` block.
     #[test]
     fn parse_verdict_strips_prose_preface_robust() {
-        let reply = "Here is the verdict:\n```json\n{\"ok\": false, \"reason\": \"build still red\"}\n```";
+        let reply =
+            "Here is the verdict:\n```json\n{\"ok\": false, \"reason\": \"build still red\"}\n```";
         let v = parse_verdict(reply).unwrap();
         assert!(!v.ok);
         assert!(v.reason.contains("build still red"));
@@ -661,7 +673,10 @@ mod tests {
         let loaded = load_sidecar(&session_id).expect("sidecar present");
         assert_eq!(loaded.condition, "ship it");
         assert_eq!(loaded.iterations, 7);
-        assert_eq!(loaded.last_unmet_reason.as_deref(), Some("tests still failing"));
+        assert_eq!(
+            loaded.last_unmet_reason.as_deref(),
+            Some("tests still failing")
+        );
 
         // Clearing with None removes the file.
         save_sidecar(&session_id, None);

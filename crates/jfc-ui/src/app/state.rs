@@ -1,5 +1,5 @@
-use std::{cell::RefCell, collections::HashMap, sync::Arc, time::Instant};
 use indexmap::IndexMap;
+use std::{cell::RefCell, collections::HashMap, sync::Arc, time::Instant};
 
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -9,17 +9,31 @@ use tokio::sync::Mutex;
 
 use crate::auto_mode::AutoModeConfig;
 use crate::context::{ReadDedupCache, ToolContext};
-use crate::provider::{ModelId, ModelInfo, Provider, ProviderId};
 use crate::query::QueryCache;
 use crate::render_cache::RenderCache;
+use crate::runtime::StreamRequestMetadata;
 use crate::slate::SlateRouter;
-use crate::tasks::TaskId;
 use crate::theme::Theme;
 use crate::types::*;
+use jfc_provider::{ModelId, ModelInfo, Provider, ProviderId};
+use jfc_session::TaskId;
 
 use super::{PendingApproval, PermissionMode, load_recent_models};
 
 pub const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 200_000;
+
+/// The expanded panel state cycled by Ctrl+T — mirrors Claude Code's
+/// `expandedView: "none" | "tasks" | "teammates"` state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExpandedView {
+    /// No expanded panel — just the normal pinned task row.
+    #[default]
+    None,
+    /// Full task list panel is showing.
+    Tasks,
+    /// Teammates/agents expanded view showing transcript previews.
+    Teammates,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct TranscriptSearch {
@@ -28,10 +42,29 @@ pub struct TranscriptSearch {
     pub cursor: usize,
 }
 
+/// Priority levels for the message queue. Higher priority messages
+/// are drained first. Mirrors CC 2.1.144's `getCommandsByMaxPriority`
+/// which supports "now" (jump the queue), "next" (drain between tool
+/// batches), and implicit "later" (drain at turn end).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum QueuePriority {
+    /// Drain at end of turn (default for normal user submissions).
+    Later = 0,
+    /// Drain between tool batches (mid-loop steering).
+    #[allow(dead_code)]
+    Next = 1,
+    /// Immediate — jump the queue, used by interrupt-on-submit.
+    #[allow(dead_code)]
+    Now = 2,
+}
+
 #[derive(Debug, Clone)]
 pub struct QueuedPrompt {
     pub text: String,
     pub is_meta: bool,
+    /// Priority level controlling when this prompt is drained.
+    #[allow(dead_code)]
+    pub priority: QueuePriority,
     /// Image/PDF attachments captured at queue time. If the user pasted
     /// an image and then typed a prompt while another turn was already
     /// streaming, the referenced `[Image #N]` attachments are extracted
@@ -40,22 +73,212 @@ pub struct QueuedPrompt {
     pub attachments: Vec<crate::attachments::Attachment>,
 }
 
+/// Priority-based message queue wrapping a VecDeque with priority semantics.
+/// Provides CC 2.1.144-style operations: enqueue with priority, dequeue by
+/// max priority, filter, pop editable, etc.
+#[derive(Debug, Clone, Default)]
+pub struct MessageQueue {
+    entries: std::collections::VecDeque<QueuedPrompt>,
+}
+
+impl MessageQueue {
+    pub fn new() -> Self {
+        Self {
+            entries: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Enqueue a prompt with the given priority.
+    pub fn push(&mut self, prompt: QueuedPrompt) {
+        self.entries.push_back(prompt);
+    }
+
+    /// Convenience: push with Later priority (default for user submissions).
+    #[allow(dead_code)]
+    pub fn push_later(
+        &mut self,
+        text: String,
+        is_meta: bool,
+        attachments: Vec<crate::attachments::Attachment>,
+    ) {
+        self.entries.push_back(QueuedPrompt {
+            text,
+            is_meta,
+            priority: QueuePriority::Later,
+            attachments,
+        });
+    }
+
+    /// Dequeue the highest-priority entry. Among same-priority entries,
+    /// FIFO order is preserved (front of the deque wins).
+    #[allow(dead_code)]
+    pub fn pop_max_priority(&mut self) -> Option<QueuedPrompt> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let max_idx = self
+            .entries
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, e)| e.priority)
+            .map(|(i, _)| i)?;
+        self.entries.remove(max_idx)
+    }
+
+    /// Dequeue entries matching a minimum priority level (inclusive).
+    /// Returns entries sorted highest-priority-first, FIFO within same level.
+    #[allow(dead_code)]
+    pub fn drain_at_least(&mut self, min_priority: QueuePriority) -> Vec<QueuedPrompt> {
+        let mut drained = Vec::new();
+        let mut remaining = std::collections::VecDeque::new();
+        for entry in self.entries.drain(..) {
+            if entry.priority >= min_priority {
+                drained.push(entry);
+            } else {
+                remaining.push_back(entry);
+            }
+        }
+        self.entries = remaining;
+        // Stable sort: highest priority first, FIFO within same level
+        drained.sort_by_key(|b| std::cmp::Reverse(b.priority));
+        drained
+    }
+
+    /// Drain ALL entries (turn-end full drain), ordered highest-priority
+    /// first with FIFO preserved within a level. The previous implementation
+    /// drained in raw insertion order, which silently ignored the
+    /// `QueuePriority` of each entry — so a `Now`/`Next` steering prompt
+    /// queued behind older `Later` prompts would not jump ahead. With every
+    /// current caller enqueuing `Later`, the stable sort is a no-op; it makes
+    /// the priority levels actually take effect once callers start using them.
+    pub fn drain_all(&mut self) -> Vec<QueuedPrompt> {
+        let mut drained: Vec<QueuedPrompt> = self.entries.drain(..).collect();
+        drained.sort_by_key(|p| std::cmp::Reverse(p.priority));
+        drained
+    }
+
+    /// Pop the last entry (for Up-arrow "edit queued" feature).
+    pub fn pop_back(&mut self) -> Option<QueuedPrompt> {
+        self.entries.pop_back()
+    }
+
+    /// Pop the first entry (FIFO drain for legacy compat).
+    #[allow(dead_code)]
+    pub fn pop_front(&mut self) -> Option<QueuedPrompt> {
+        self.entries.pop_front()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[allow(dead_code)]
+    /// Index access (for test assertions).
+    pub fn get(&self, index: usize) -> Option<&QueuedPrompt> {
+        self.entries.get(index)
+    }
+
+    /// Iterate (for rendering, contains checks, etc.).
+    pub fn iter(&self) -> impl Iterator<Item = &QueuedPrompt> {
+        self.entries.iter()
+    }
+}
+
+// Support indexing for backward compat with tests that do `app.queued_prompts[0]`
+impl std::ops::Index<usize> for MessageQueue {
+    type Output = QueuedPrompt;
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.entries[index]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkRecoveryProvider {
+    Anthropic,
+    AnthropicOAuth,
+    OpenWebUI,
+}
+
+impl NetworkRecoveryProvider {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::AnthropicOAuth => "anthropic-oauth",
+            Self::OpenWebUI => "openwebui",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkRecoveryReason {
+    Overloaded,
+    RateLimited,
+    ServerError,
+    Transient,
+}
+
+impl NetworkRecoveryReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Overloaded => "overloaded",
+            Self::RateLimited => "rate limited",
+            Self::ServerError => "server error",
+            Self::Transient => "retryable",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NetworkRecoveryStatus {
+    pub provider: NetworkRecoveryProvider,
+    pub reason: NetworkRecoveryReason,
+    pub status_code: Option<u16>,
+    pub attempts: u32,
+    pub updated_at: Instant,
+}
+
 pub const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 pub const IDLE_TICK_MS: u64 = 80;
 pub const ANIM_TICK_MS: u64 = 33;
-/// If no stream event arrives within this duration while `is_streaming` is
-/// true, the watchdog resets the flag to stop the 30fps animation loop.
-pub const STREAM_WATCHDOG_TIMEOUT_SECS: u64 = 30;
+/// Hard idle limit for a provider stream. This must stay longer than the
+/// provider HTTP read timeout (600s) so the HTTP layer, not the UI watchdog,
+/// reports real network failures. Anthropic/Bedrock streams can legitimately
+/// go quiet for minutes while the model is thinking or an upstream proxy is
+/// queueing.
+pub const STREAM_WATCHDOG_TIMEOUT_SECS: u64 = 660;
 /// Cap on how many turns of token usage we retain for the info-sidebar
 /// sparkline. 32 datapoints fit comfortably in a 30-col-wide sidebar
 /// while still showing a meaningful trend.
 pub const TOKEN_HISTORY_CAP: usize = 32;
+
+/// Maximum number of pending `<system-reminder>` bodies retained between
+/// user turns. Reminders come from filesystem events, MCP changes, and
+/// watcher notifications — during long idle sessions a stream of unique
+/// log lines would otherwise grow `pending_background_reminders`
+/// unbounded. Once the queue is full, the oldest reminder is dropped
+/// before a new one is pushed; on the next turn the survivors get
+/// flushed via `take_background_reminders`. 20 is enough to never lose
+/// signal in normal use, small enough that the per-turn injection stays
+/// bounded.
+pub const BACKGROUND_REMINDERS_CAP: usize = 20;
 
 pub struct BackgroundTask {
     pub task_id: crate::ids::TaskId,
     pub description: String,
     pub status: crate::types::TaskLifecycle,
     pub started_at: std::time::Instant,
+    /// When the task transitioned into a terminal state (Completed /
+    /// Failed / Aborted). `None` while the task is still alive. Used by
+    /// `render_subagent_tree` to keep the "pinned" hollow-circle row on
+    /// screen for `COMPLETED_PIN_WINDOW` *after completion*, regardless
+    /// of how long the task ran. Without this a solver that took longer
+    /// than 5 minutes would vanish the very instant it finished — the
+    /// "disappearing solver" bug.
+    pub completed_at: Option<std::time::Instant>,
     pub summary: Option<String>,
     pub error: Option<String>,
     pub last_tool: Option<String>,
@@ -84,6 +307,12 @@ pub struct BackgroundTask {
     /// Model the agent is currently using. Captured from the spawn site
     /// so per-agent cost can be computed via `cost::cost_for(model, usage)`.
     pub model_used: Option<String>,
+    /// Agent's own message transcript — populated by AgentChunk events
+    /// from the swarm runner. Used for transcript foregrounding (when
+    /// the user presses Enter on an agent in Ctrl+X, we render these
+    /// instead of app.messages).
+    #[allow(dead_code)]
+    pub agent_messages: Vec<crate::types::ChatMessage>,
     /// Per-agent token budget. When set and `latest_input + cumulative_output`
     /// exceeds it, the agent is forcibly terminated and an error toast
     /// fires. Defaults to None (unlimited).
@@ -113,7 +342,18 @@ pub struct App {
     /// for the spinner's token estimate (matches v126's `responseLengthRef.current / 4`).
     /// Reset at the start of each streaming turn.
     pub streaming_response_bytes: usize,
+    /// Visible while a provider is silently retrying a transient network/API
+    /// failure. The spinner replaces its normal cycling verb with this code
+    /// until the next real stream byte arrives.
+    pub network_recovery_status: Option<NetworkRecoveryStatus>,
+    pub network_recovery_attempts: u32,
+    /// Latest status.claude.com heartbeat. This is intentionally
+    /// best-effort UI context, not a dependency for provider requests.
+    pub claude_status: Option<crate::claude_status::ClaudeStatusSnapshot>,
+    pub claude_status_error: Option<String>,
     pub streaming_assistant_idx: Option<usize>,
+    /// Last message ID from the API response, for `diagnostics.previous_message_id`.
+    pub last_response_id: Option<String>,
     pub is_streaming: bool,
     /// Updated on every inbound stream event (chunk, tool delta, done, error).
     /// Used by the watchdog to detect stuck `is_streaming` flags — if no
@@ -136,6 +376,23 @@ pub struct App {
     /// tokens)` after a multi-turn turn was: the timer reset every
     /// loop iteration. v126's spinner uses the same turn-level clock.
     pub turn_started_at: Option<Instant>,
+    /// Cumulative session cost (USD) snapshotted at the start of the current
+    /// user turn. The end-of-turn footer subtracts this from the live
+    /// cumulative total so it shows the *per-turn* cost ("Cooked for 2m /
+    /// $0.04") rather than the whole session's running spend. Captured at the
+    /// same points `turn_started_at` is set to a fresh `Some(now)`, so it
+    /// survives across agentic-loop sub-streams within one turn.
+    pub turn_start_cost: f64,
+    /// Number of API round-trips in the current user turn (incremented each
+    /// time `continue_agentic_loop` fires). Resets on each user submission.
+    /// Used to enforce a max-turns safety limit (default 200, matching CC
+    /// 2.1.144's `maxTurns`). Without this, a model stuck in a retry loop
+    /// runs indefinitely, burning unlimited API credits.
+    pub agentic_turn_count: u32,
+    /// Text saved by Esc-clear so Up-arrow can recall it. Single slot —
+    /// each Esc-clear overwrites. None when no text has been cleared.
+    #[allow(dead_code)]
+    pub esc_saved_text: Option<String>,
     /// Index into `messages` of the user-prompt the up-arrow recall is
     /// currently displaying, counting backwards from the end. `None`
     /// means the user is editing a fresh prompt (not recalled). Each
@@ -198,7 +455,7 @@ pub struct App {
     /// AND the approval pipeline is empty. Each entry remembers whether the
     /// user typed a slash command (v126's `isMeta: true`) — those run
     /// locally on drain instead of going to the API.
-    pub queued_prompts: std::collections::VecDeque<QueuedPrompt>,
+    pub queued_prompts: MessageQueue,
     /// Cached count of agent-isolated worktrees (excludes the primary
     /// checkout). Refreshed by the Tick handler at most every
     /// `WORKTREE_REFRESH_MS` so the status-bar badge stays accurate
@@ -298,6 +555,15 @@ pub struct App {
     /// pattern: tasks holding state must be explicitly cancellable, not
     /// just dropped via a flag the task may never poll.
     pub cancel_token: tokio_util::sync::CancellationToken,
+    /// JoinHandle for the outer stream-driver task spawned per user turn.
+    /// Watchdog escalation: when `check_stream_watchdog` detects a
+    /// hard-idle stream it cancels the token (cooperative) *and* aborts
+    /// this handle (forceful). Without the forceful abort a stream task
+    /// stuck in a synchronous syscall (DNS resolution, audit-log write)
+    /// would survive the cancel and the next user submission would
+    /// race a second concurrent stream task writing the same conversation
+    /// buffer.
+    pub active_stream_handle: Option<tokio::task::JoinHandle<()>>,
     /// Timestamp of the most recent ESC press in the main shortcut
     /// handler. The next ESC within `INTERRUPT_DOUBLE_TAP_MS` triggers
     /// an interrupt instead of just clearing the input.
@@ -306,12 +572,48 @@ pub struct App {
     pub session_approved: Vec<String>,
     pub follow_bottom: bool,
     pub pending_tool_calls: Vec<ToolCall>,
+    /// Count of auto-mode classifier verdicts still in flight. Each tool in
+    /// auto-mode spawns an async classifier call (2-5s); until every verdict
+    /// lands, `stream_done` must hold the turn open instead of finalizing —
+    /// otherwise a late verdict finds the streaming slot already cleared and
+    /// the tool is silently dropped (never dispatched, loop stalls). Reset to
+    /// 0 at the start of every user turn so a verdict that never arrives
+    /// (e.g. cancelled mid-classification) can't wedge the next turn.
+    pub pending_classifications: usize,
+    /// Tool IDs already dispatched mid-stream (safe tools that started
+    /// executing while the model was still generating). stream_done
+    /// skips these to avoid double-dispatch.
+    pub pre_dispatched_tool_ids: std::collections::HashSet<String>,
+    /// Metadata for the provider request currently streaming or most recently
+    /// finished. Set by `StreamEvent::RequestMetadata` before the first byte
+    /// arrives; cleared when the turn truly ends. Used to detect narration-only
+    /// EndTurn responses on prompts that were expected to call tools.
+    pub current_stream_request: Option<StreamRequestMetadata>,
     pub max_context_tokens: usize,
     /// Set by `/compact` slash command. Picked up by the main loop next time
     /// it would otherwise check `compact::should_compact` — forces compaction
     /// regardless of token level. Cleared after the compact runs (success or
     /// not) so a single `/compact` invocation triggers exactly one attempt.
     pub force_compact_pending: bool,
+    /// Set when a stream's `Done` event carries `StopReason::PauseTurn`
+    /// AND the same response also produced local tools that need to
+    /// run (mixed mode). The dispatch ladder in event_loop.rs sees
+    /// `has_pending_tools` first and routes to local-tool execution,
+    /// shadowing the PauseTurn branch. Without this flag, the
+    /// post-tool `ToolEvent::AllComplete` handler defaults to
+    /// `continue_agentic_loop` which routes through
+    /// `build_provider_messages_with_tool_results` → injects the
+    /// "Continue from where you left off." synthetic-user filler that
+    /// Anthropic's `pause_turn` protocol explicitly forbids
+    /// (cli.js v142:622686). When set, AllComplete instead calls
+    /// `continue_after_pause_turn` so the resume goes out with the
+    /// trailing `server_tool_use` as the resumption cue, intact.
+    ///
+    /// Cleared the moment the resume dispatches OR the turn ends
+    /// without resuming (no pending tools, no pending approvals,
+    /// EndTurn) — single-shot per pause_turn occurrence so a later
+    /// non-pause_turn turn doesn't accidentally inherit the routing.
+    pub pending_pause_turn_resume: bool,
     /// Set after compaction permanently fails (CircuitBreakerTripped,
     /// Unsupported, Exhausted). Prevents the post-response handler from
     /// re-spawning compact on every AllToolsComplete — without this, the
@@ -324,6 +626,10 @@ pub struct App {
     /// `Compacting…` spinner whenever this is `Some`, so a long pre-submit
     /// compaction doesn't look like a frozen UI.
     pub compacting_started_at: Option<Instant>,
+    /// Whether a speculative (precomputed) compact has already been
+    /// triggered for this session. Prevents repeated spawns. Resets
+    /// on compaction completion or /clear.
+    pub speculative_compact_fired: bool,
     /// Cumulative summary-text length collected during the in-flight
     /// compact (across all retry attempts). The spinner divides by 4 to
     /// get a chars-per-token estimate and renders `↓ Nk tokens` —
@@ -351,6 +657,13 @@ pub struct App {
     pub model_picker_filter: String,
     pub model_picker_selected: usize,
     pub model_picker_models: Vec<ModelInfo>,
+    /// Session-picker popup state — same `Clear`+centered-table treatment as
+    /// the model picker. Toggled with Ctrl+P. Replaces the "Ctrl+B opens the
+    /// session list as a left sidebar" hack for one-shot session selection.
+    /// `session_picker_filter` filters by `display_title()` substring.
+    pub show_session_picker: bool,
+    pub session_picker_filter: String,
+    pub session_picker_state: TableState,
     /// Drives selection + scroll for the picker's `Table`. Kept in sync with
     /// `model_picker_selected` so existing handlers keep working, but ratatui's
     /// stateful render uses the `TableState` for autoscroll when the cursor moves
@@ -376,7 +689,7 @@ pub struct App {
     /// sidebar opens. Storing here keeps render() pure of disk I/O. Replaced
     /// the raw-id `session_ids` cache so the sidebar can show titles, cwd
     /// badges, and relative timestamps instead of `ses_2026...` ids.
-    pub session_meta: Vec<crate::session::SessionMetadata>,
+    pub session_meta: Vec<jfc_session::SessionMetadata>,
     /// Currently-selected sidebar row.
     pub session_selected: usize,
     /// State for the sidebar `List` widget — drives auto-scroll when the
@@ -393,16 +706,20 @@ pub struct App {
     /// v126 task/todo store. Persists to `~/.config/jfc/tasks/<session>.json`
     /// so todos survive session resume and compaction. Reused across the
     /// agent's turns; the slash commands `/task-*` poke it directly.
-    pub task_store: std::sync::Arc<crate::tasks::TaskStore>,
+    pub task_store: std::sync::Arc<jfc_session::TaskStore>,
     /// Records when each task transitioned to `Completed` so the footer can
     /// keep showing them for 30 seconds with dimmed/strikethrough styling.
     pub task_completion_times: HashMap<TaskId, Instant>,
     /// Whether the full-screen task panel overlay is visible (Ctrl+T).
     pub show_task_panel: bool,
+    /// The expanded view state — cycles none → tasks → teammates → none on Ctrl+T.
+    pub expanded_view: ExpandedView,
     /// Currently-selected row in the task panel.
     pub task_panel_selected: usize,
     /// Drives selection + scroll for the task panel's `Table`.
     pub task_panel_state: TableState,
+    /// Whether the detail pane is shown for the currently-selected task.
+    pub task_panel_detail: bool,
     /// Transient per-session map of task_id → current activity description.
     /// Updated by the tool execution loop to show what an in_progress task is
     /// doing (e.g. "Running bash: cargo test", "Reading src/main.rs").
@@ -413,8 +730,8 @@ pub struct App {
     pub plan_verified_this_batch: bool,
     pub last_usage_input: u32,
     pub last_usage_output: u32,
-    /// Auto-expiring toast queue. Pruned every `Tick`. Pushed via
-    /// `AppEvent::Toast` from anywhere in the app (compaction milestones,
+    /// Auto-expiring toast queue. Pruned every `UiEvent::Tick`. Pushed via
+    /// `AppEvent::Ui(UiEvent::Toast)` from anywhere in the app (compaction milestones,
     /// session save success, classifier blocks). Mirrors v126's terminal
     /// `notification()` for non-blocking status surfacing.
     pub toasts: Vec<crate::toast::Toast>,
@@ -431,7 +748,7 @@ pub struct App {
     /// Active LSP diagnostics, keyed by file path. Rendered as a one-line
     /// `Found N new diagnostic issue(s) in M file(s) (ctrl+o to expand)`
     /// row above the spinner when non-empty. Updated by
-    /// `AppEvent::DiagnosticsUpdated`. Mirrors v126 cli.js:338030-338040.
+    /// `AppEvent::Provider(ProviderEvent::DiagnosticsUpdated)`. Mirrors v126 cli.js:338030-338040.
     pub diagnostics: Vec<crate::diagnostics::DiagnosticEntry>,
     /// Whether the Ctrl+O diagnostic-expansion panel is open. v126 cli.js
     /// :338038 advertises `(ctrl+o to expand)` on the summary row; this
@@ -495,6 +812,14 @@ pub struct App {
     /// compares against `file_watcher::keybindings_change_counter()` to
     /// detect `keybindings.toml` edits and hot-reload them.
     pub last_keybindings_watcher_seen: u64,
+    /// Queue of `<system-reminder>` bodies posted by background events
+    /// (file watcher, MCP `tools/list_changed`, …) awaiting consumption
+    /// by the next outbound stream request. The drain happens in
+    /// `prepare_stream_request`, so the reminder lands in the wire
+    /// payload exactly once and `app.messages` is never mutated by an
+    /// FS-rate signal. Dedup-on-push collapses N filesystem events
+    /// between turns into one reminder.
+    pub pending_background_reminders: Vec<String>,
     /// Message indices the user pinned via `/pin <idx>`. Compaction
     /// preserves pinned messages verbatim regardless of token pressure.
     /// Stored as indices into `messages` rather than a flag on
@@ -512,11 +837,13 @@ pub struct App {
     /// tool runs. Capped at 100 entries (the oldest gets dropped). New
     /// entries push to the back; /undo pops the back (most recent
     /// first).
+    #[allow(dead_code)]
     pub tool_undo_history: std::collections::VecDeque<crate::types::ToolUndoEntry>,
     /// v132 Marsh (mid-stream bash → model) buffer. Each entry is
     /// `(tool_id, line)` captured from `ToolOutputChunk`. `stream.rs`
     /// drains this on the next outbound request so the model sees what
     /// bash printed since the last turn.
+    #[allow(dead_code)]
     pub pending_marsh_chunks: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
     /// Highest budget threshold the user has been warned about so far this
     /// session. 0 = no warnings yet, 80 = 80% warning shown, 100 = 100%
@@ -529,6 +856,47 @@ pub struct App {
     /// iteration order.
     pub background_tasks: IndexMap<String, BackgroundTask>,
     pub show_info_sidebar: bool,
+    /// Vertical scroll offset (rows from top) of the right-side info sidebar's
+    /// Tasks section. A long todo list (the user hit 27 in one session) now
+    /// renders compactly and scrolls instead of overflowing the panel.
+    /// Adjusted via Alt+Up / Alt+Down while the sidebar is visible.
+    pub info_sidebar_scroll: u16,
+    /// Rolling samples of the EKG trace, rendered under the Context gauge.
+    /// Each value is a 0-8 amplitude that maps to one cell of the
+    /// `▁▂▃▄▅▆▇█` block-element scale. Driven by a synthetic PQRST
+    /// generator (see `network_phase`) whose R-wave amplitude scales with
+    /// recent SSE byte arrivals — the trace beats continuously like a
+    /// real heart monitor; activity makes the QRS spike taller.
+    pub network_samples: std::collections::VecDeque<u8>,
+    /// Last sampled value of `network_bytes_in`. Subtracted on each
+    /// tick to derive a delta level that drives the EKG's R-wave
+    /// amplitude. Distinct from `streaming_response_bytes` (which
+    /// resets every turn): this snapshot is itself monotonic so the
+    /// per-tick delta is always non-negative.
+    pub network_last_sampled_bytes: u64,
+    /// Monotonic byte counter for the EKG — bumped by EVERY incoming
+    /// stream event (text, reasoning, tool input delta, redacted
+    /// thinking, server tool results, usage, response IDs). Doesn't
+    /// reset between turns, so a quiet between-turn gap still shows
+    /// as flat-line baseline rather than a fake "burst" when the
+    /// next turn's bytes arrive against a freshly-cleared counter.
+    pub network_bytes_in: u64,
+    /// Phase index into the PQRST cycle. Bumps once per active-beat
+    /// tick; gets snapped back to 0 when a new burst arrives (so the
+    /// user always sees beats start from PR onset, not mid-T). See
+    /// `runtime/network_ekg.rs`.
+    pub network_phase: usize,
+    /// Phases remaining in the *currently active* beat. 0 = flat-line
+    /// (the trace draws baseline cells until the next byte triggers a
+    /// fresh beat). Re-armed to `PATTERN_LEN` on every non-zero
+    /// per-tick delta.
+    pub network_beat_remaining: usize,
+    /// Smoothed activity factor (0.0 idle → 1.0 fully active) that
+    /// scales the R-wave amplitude. EMA-eased toward the latest
+    /// per-tick byte-delta so a burst takes a few ticks to grow the
+    /// spike and a few ticks to relax back to baseline — gives the
+    /// trace the natural "fade out" of a real monitor.
+    pub network_activity: f32,
     pub mcp_servers: Vec<crate::types::McpServerInfo>,
     pub lsp_servers: Vec<crate::types::LspServerInfo>,
     pub usage_by_model: HashMap<String, crate::types::ModelUsage>,
@@ -557,8 +925,8 @@ pub struct App {
     /// Set of `BackgroundTask.messages` indices the user expanded with `o`
     /// while drilled into the subagent task view. Long entries (>80 lines or
     /// >5 KB) collapse to a 5-line preview by default; presence in this set
-    /// flips them to fully expanded. Cleared whenever `viewing_task_id`
-    /// changes so expansion state is per-drill-in, not sticky across tasks.
+    /// > flips them to fully expanded. Cleared whenever `viewing_task_id`
+    /// > changes so expansion state is per-drill-in, not sticky across tasks.
     ///
     /// TODO Phase B: once `BackgroundTask.messages` migrates to
     /// `Vec<ChatMessage>` and the subagent view renders through the same
@@ -655,6 +1023,18 @@ pub struct App {
     pub scroll_velocity: f32,
     /// Last tick instant for kinetic scroll dt calculation.
     pub last_scroll_tick: std::time::Instant,
+    /// Last time the user interacted (typed, submitted, scrolled).
+    /// Used for idle-return detection (suggest /clear after 75min away).
+    pub last_user_activity_at: std::time::Instant,
+    /// Whether the idle-return toast has been shown this idle period.
+    pub idle_return_shown: bool,
+    /// Files pinned into the system prompt (survive compaction).
+    /// Auto-populated from files that are re-read after every compaction.
+    #[allow(dead_code)]
+    pub pinned_files: Vec<std::path::PathBuf>,
+    /// Tracks how many times each file is re-read after compaction.
+    /// When a file exceeds 3 re-reads post-compact, it's promoted to pinned_files.
+    pub post_compact_reads: std::collections::HashMap<std::path::PathBuf, u32>,
     /// Throttle for idle_prefetch: last time a prefetch batch was fired.
     pub last_prefetch_at: std::time::Instant,
     /// Number of prefetch reads currently in-flight (capped at 2).
@@ -694,12 +1074,20 @@ impl App {
             streaming_text: String::new(),
             streaming_reasoning: String::new(),
             streaming_response_bytes: 0,
+            network_recovery_status: None,
+            network_recovery_attempts: 0,
+            claude_status: None,
+            claude_status_error: None,
             streaming_assistant_idx: None,
+            last_response_id: None,
             streaming_started_at: None,
             streaming_last_token_at: None,
             thinking_started_at: None,
             thinking_ended_at: None,
             turn_started_at: None,
+            turn_start_cost: 0.0,
+            agentic_turn_count: 0,
+            esc_saved_text: None,
             history_cursor: None,
             is_streaming: false,
             last_stream_event_at: None,
@@ -722,7 +1110,7 @@ impl App {
             reasoning_expanded: HashMap::new(),
             pending_approval: None,
             approval_queue: std::collections::VecDeque::new(),
-            queued_prompts: std::collections::VecDeque::new(),
+            queued_prompts: MessageQueue::new(),
             worktree_count: 0,
             worktree_count_last_refresh: None,
             git_branch: None,
@@ -745,6 +1133,7 @@ impl App {
             last_active_agent_task: None,
             interrupt_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancel_token: tokio_util::sync::CancellationToken::new(),
+            active_stream_handle: None,
             last_esc_at: None,
             always_approved: Vec::new(),
             session_approved: Vec::new(),
@@ -752,9 +1141,14 @@ impl App {
             tool_ctx: ToolContext::new(),
             dedup_cache: Arc::new(Mutex::new(ReadDedupCache::new())),
             pending_tool_calls: Vec::new(),
+            pending_classifications: 0,
+            pre_dispatched_tool_ids: std::collections::HashSet::new(),
+            current_stream_request: None,
             force_compact_pending: false,
+            pending_pause_turn_resume: false,
             compact_suppressed: false,
             compacting_started_at: None,
+            speculative_compact_fired: false,
             compacting_output_chars: 0,
             compacting_attempt_baseline: 0,
             compacting_last_progress: 0,
@@ -763,6 +1157,9 @@ impl App {
             input_wrap_width: 1,
             show_model_picker: false,
             model_picker_filter: String::new(),
+            show_session_picker: false,
+            session_picker_filter: String::new(),
+            session_picker_state: TableState::default().with_selected(Some(0)),
             model_picker_selected: 0,
             model_picker_models: Vec::new(),
             model_picker_state: TableState::default().with_selected(Some(0)),
@@ -775,7 +1172,7 @@ impl App {
             session_meta: Vec::new(),
             session_selected: 0,
             session_list_state: ratatui::widgets::ListState::default(),
-            current_session_id: Some(crate::session::generate_session_id()),
+            current_session_id: Some(jfc_session::generate_session_id()),
             auto_mode: crate::auto_mode::load_config(),
             permission_mode: PermissionMode::Default,
             // Tasks are scoped per-session (mirrors v126 cli.js:271505 keying
@@ -786,11 +1183,13 @@ impl App {
             // changes (load from sidebar, /continue, /clear).
             // NOTE: initialized as in_memory here; re-opened with the real
             // session_id after construction (see below).
-            task_store: crate::tasks::TaskStore::in_memory(),
+            task_store: jfc_session::TaskStore::in_memory(),
             task_completion_times: HashMap::new(),
             show_task_panel: false,
+            expanded_view: ExpandedView::None,
             task_panel_selected: 0,
             task_panel_state: TableState::default().with_selected(Some(0)),
+            task_panel_detail: false,
             task_activities: HashMap::new(),
             plan_verified_this_batch: false,
             last_usage_input: 0,
@@ -811,6 +1210,7 @@ impl App {
             last_mcp_refresh_seen: 0,
             last_file_watcher_seen: 0,
             last_keybindings_watcher_seen: 0,
+            pending_background_reminders: Vec::new(),
             pinned_message_indices: std::collections::HashSet::new(),
             verbose_mode: false,
             fast_mode: false,
@@ -819,6 +1219,13 @@ impl App {
             cost_budget_warned_at: 0,
             background_tasks: IndexMap::new(),
             show_info_sidebar: true,
+            info_sidebar_scroll: 0,
+            network_samples: std::collections::VecDeque::with_capacity(64),
+            network_last_sampled_bytes: 0,
+            network_bytes_in: 0,
+            network_phase: 0,
+            network_beat_remaining: 0,
+            network_activity: 0.0,
             mcp_servers: Vec::new(),
             lsp_servers: Vec::new(),
             usage_by_model: HashMap::new(),
@@ -856,14 +1263,24 @@ impl App {
             wants_animation_frame: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             scroll_velocity: 0.0,
             last_scroll_tick: std::time::Instant::now(),
+            last_user_activity_at: std::time::Instant::now(),
+            idle_return_shown: false,
+            pinned_files: Vec::new(),
+            post_compact_reads: std::collections::HashMap::new(),
             last_prefetch_at: std::time::Instant::now() - std::time::Duration::from_secs(10),
             prefetch_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             git_root: None,
             last_system_prompt_len: None,
         };
-        // Open the task store with the real session id so tasks persist to disk.
-        if let Some(ref sid) = app.current_session_id {
-            app.task_store = crate::tasks::TaskStore::open(sid.as_str());
+        // Open the task store — prefer project-level persistence so tasks
+        // survive across ALL sessions in the same repo. Falls back to
+        // per-session store only when no git root is discoverable.
+        let git_root = crate::context::discover_git_root();
+        if let Some(ref root) = git_root {
+            app.task_store = jfc_session::TaskStore::open_project(Some(root.as_path()));
+            app.git_root = Some(Some(root.clone()));
+        } else if let Some(ref sid) = app.current_session_id {
+            app.task_store = jfc_session::TaskStore::open(sid.as_str());
         }
         app.sync_selected_context_window();
         tracing::info!(
@@ -873,5 +1290,36 @@ impl App {
             "App::new"
         );
         app
+    }
+
+    /// Push a `<system-reminder>` body onto the background-reminders
+    /// queue. Dedupes by exact body — repeated filesystem events
+    /// produce at most one reminder per outgoing turn. The queue is
+    /// capped at [`BACKGROUND_REMINDERS_CAP`]; when full, the oldest
+    /// entry is dropped before pushing. This keeps long idle sessions
+    /// from accumulating an unbounded stream of unique log lines that
+    /// would otherwise leak memory until the next user prompt drains
+    /// the queue.
+    pub fn queue_background_reminder(&mut self, body: impl Into<String>) {
+        let body = body.into();
+        if self
+            .pending_background_reminders
+            .iter()
+            .any(|existing| existing == &body)
+        {
+            return;
+        }
+        if self.pending_background_reminders.len() >= BACKGROUND_REMINDERS_CAP {
+            self.pending_background_reminders.remove(0);
+        }
+        self.pending_background_reminders.push(body);
+    }
+
+    /// Drain the background-reminders queue, transferring ownership to
+    /// the caller. Called by the stream-open path to forward the
+    /// reminders into `StreamRequestOverrides`. After this call the
+    /// queue is empty until the next FS event arrives.
+    pub fn take_background_reminders(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_background_reminders)
     }
 }

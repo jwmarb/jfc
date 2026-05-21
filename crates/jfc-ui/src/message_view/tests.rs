@@ -1,13 +1,11 @@
 #![cfg(all(test, feature = "anthropic-oauth-sensitive"))]
 use super::assistant_parts::{find_tool_at, sanitize_terminal_text, truncate_str};
 use super::bash::{BashCmdKind, classify_bash_cmd};
-use super::core::{build_render_items_ctx, RenderCtx, is_groupable, severity_rank};
+use super::core::{RenderCtx, build_render_items_ctx, is_groupable, severity_rank};
 use super::detection::{looks_like_difftastic_output, looks_like_git_diff_output};
+use super::formatters::{produce_command_output_lines, produce_git_diff_output_lines};
 use super::output_style::path_color;
-use super::outputs::{
-    GrepLine, grep_target_file, parse_grep_line, parse_grep_no_path, parse_grep_with_sep,
-    produce_command_output_lines, produce_diff_view_lines, produce_git_diff_output_lines,
-};
+use super::outputs::produce_diff_view_lines;
 use super::syntax::{
     infer_lang_from_bash, infer_lang_from_tool, lang_from_path, looks_like_markdown, redact_quoted,
 };
@@ -17,6 +15,9 @@ use super::tool_blocks::{
     render_tool_block, tool_body_lines_themed, tool_title_width_cap,
 };
 use super::tool_height::{tool_block_height, tool_block_height_pub, tool_content_height_with_tool};
+use super::truncation::{
+    GrepLine, grep_target_file, parse_grep_line, parse_grep_no_path, parse_grep_with_sep,
+};
 use super::*;
 
 #[cfg(test)]
@@ -640,6 +641,7 @@ mod helper_tests {
             display: crate::types::ToolDisplayState::DEFAULT,
             elapsed_ms: None,
             started_at: None,
+            thought_signature: None,
         }
     }
 
@@ -1313,6 +1315,7 @@ mod helper_tests {
             display: crate::types::ToolDisplayState::DEFAULT,
             elapsed_ms: None,
             started_at: None,
+            thought_signature: None,
         };
         let (g0, _) = tool_status_icon_animated(&tool, &t, 0);
         let (g6, _) = tool_status_icon_animated(&tool, &t, 6);
@@ -1338,6 +1341,7 @@ mod helper_tests {
             display: crate::types::ToolDisplayState::DEFAULT,
             elapsed_ms: None,
             started_at: None,
+            thought_signature: None,
         };
         let (g0, _) = tool_status_icon_animated(&tool, &t, 0);
         let (g100, _) = tool_status_icon_animated(&tool, &t, 100);
@@ -1361,6 +1365,7 @@ mod helper_tests {
             display: crate::types::ToolDisplayState::DEFAULT,
             elapsed_ms: None,
             started_at: None,
+            thought_signature: None,
         };
         let (g, _) = tool_status_icon_animated(&tool, &t, 42);
         assert_eq!(g, "✗");
@@ -2176,7 +2181,7 @@ fatal: external diff died, stopping at crates/jfc-ui/src/agents.rs\n";
     #[test]
     fn message_view_total_lines_empty_app_normal() {
         // Build a fake App via the test helpers — empty messages → 0 lines.
-        use crate::provider::{EventStream, ModelInfo, Provider, ProviderMessage, StreamOptions};
+        use jfc_provider::{EventStream, ModelInfo, Provider, ProviderMessage, StreamOptions};
         use std::sync::Arc;
 
         struct Stub;
@@ -2196,7 +2201,7 @@ fatal: external diff died, stopping at crates/jfc-ui/src/agents.rs\n";
                 Ok(Box::pin(futures::stream::empty()))
             }
         }
-        impl crate::provider::seal::Sealed for Stub {}
+        impl jfc_provider::seal::Sealed for Stub {}
 
         let app = App::new(Arc::new(Stub), "test-model");
         // No messages → 0 lines.
@@ -2226,7 +2231,7 @@ fatal: external diff died, stopping at crates/jfc-ui/src/agents.rs\n";
     }
 
     fn stub_app() -> App {
-        use crate::provider::{EventStream, ModelInfo, Provider, ProviderMessage, StreamOptions};
+        use jfc_provider::{EventStream, ModelInfo, Provider, ProviderMessage, StreamOptions};
         use std::sync::Arc;
         struct Stub;
         #[async_trait::async_trait]
@@ -2245,7 +2250,7 @@ fatal: external diff died, stopping at crates/jfc-ui/src/agents.rs\n";
                 Ok(Box::pin(futures::stream::empty()))
             }
         }
-        impl crate::provider::seal::Sealed for Stub {}
+        impl jfc_provider::seal::Sealed for Stub {}
         App::new(Arc::new(Stub), "test-model")
     }
 
@@ -2308,6 +2313,7 @@ fatal: external diff died, stopping at crates/jfc-ui/src/agents.rs\n";
             summary: Some(summary),
             error: None,
             elapsed_ms: Some(1234),
+            model: None,
         }));
         app.messages.push(msg);
         let w = 60usize;
@@ -2403,6 +2409,7 @@ fatal: external diff died, stopping at crates/jfc-ui/src/agents.rs\n";
             display: crate::types::ToolDisplayState::DEFAULT,
             elapsed_ms: Some(120),
             started_at: None,
+            thought_signature: None,
         };
         for w in [40u16, 80u16] {
             let predicted = tool_block_height(&tool, w as usize);
@@ -2460,6 +2467,7 @@ fatal: external diff died, stopping at crates/jfc-ui/src/agents.rs\n";
             display: crate::types::ToolDisplayState::DEFAULT,
             elapsed_ms: None,
             started_at: None,
+            thought_signature: None,
         };
         for w in [60u16, 100u16] {
             let predicted = tool_block_height(&tool, w as usize);
@@ -2502,6 +2510,7 @@ fatal: external diff died, stopping at crates/jfc-ui/src/agents.rs\n";
             },
             elapsed_ms: None,
             started_at: None,
+            thought_signature: None,
         };
         for expanded in [false, true] {
             let tool = make_tool(expanded);

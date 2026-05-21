@@ -149,7 +149,12 @@ async fn search_papers_combined(query: &str, max_results: usize) -> Result<Strin
         }
         if !e.abstract_text.is_empty() {
             let preview = if e.abstract_text.len() > 200 {
-                format!("{}...", &e.abstract_text[..200])
+                // Char-boundary safe slice — web abstracts carry UTF-8
+                // (em-dashes, smart quotes, non-Latin scripts) and a
+                // raw byte slice panics when a multi-byte glyph
+                // straddles the cap (slop_guard.rs hit this in prod).
+                let cap = e.abstract_text.floor_char_boundary(200);
+                format!("{}...", &e.abstract_text[..cap])
             } else {
                 e.abstract_text.clone()
             };
@@ -237,11 +242,11 @@ struct GoogleConfigKey {
 }
 
 fn load_google_keys() -> Vec<CseKey> {
-    if let Some(keys) = load_google_keys_from_config() {
-        if !keys.is_empty() {
-            tracing::info!(count = keys.len(), "Google CSE keys loaded from config");
-            return keys;
-        }
+    if let Some(keys) = load_google_keys_from_config()
+        && !keys.is_empty()
+    {
+        tracing::info!(count = keys.len(), "Google CSE keys loaded from config");
+        return keys;
     }
     if let (Ok(api_key), Ok(cx)) = (
         std::env::var("GOOGLE_CSE_API_KEY"),
@@ -309,7 +314,7 @@ async fn search_google(query: &str, max_results: usize) -> Result<String, String
             .to_string()
     })?;
 
-    let num = max_results.min(10).max(1);
+    let num = max_results.clamp(1, 10);
     let client = http_client()?;
     let num_str = num.to_string();
 
@@ -395,7 +400,7 @@ fn arxiv_to_paper(e: ArxivEntry) -> PaperEntry {
 
 /// Run an arXiv search and return structured entries (used by combined search).
 async fn search_arxiv_entries(query: &str, max_results: usize) -> Result<Vec<PaperEntry>, String> {
-    let num = max_results.min(20).max(1);
+    let num = max_results.clamp(1, 20);
     let client = http_client()?;
     let num_str = num.to_string();
 
@@ -426,7 +431,7 @@ async fn search_arxiv_entries(query: &str, max_results: usize) -> Result<Vec<Pap
 }
 
 async fn search_arxiv(query: &str, max_results: usize) -> Result<String, String> {
-    let num = max_results.min(20).max(1);
+    let num = max_results.clamp(1, 20);
     let client = http_client()?;
     let num_str = num.to_string();
 
@@ -477,7 +482,12 @@ async fn search_arxiv(query: &str, max_results: usize) -> Result<String, String>
             ));
             // Truncate abstract to ~200 chars for readability.
             let summary = if entry.summary.len() > 200 {
-                format!("{}...", &entry.summary[..200])
+                {
+                    // Char-boundary safe — see comment in the abstract_text
+                    // truncation above for the slop_guard.rs precedent.
+                    let cap = entry.summary.floor_char_boundary(200);
+                    format!("{}...", &entry.summary[..cap])
+                }
             } else {
                 entry.summary.clone()
             };
@@ -596,10 +606,10 @@ fn semantic_scholar_api_key() -> Option<&'static str> {
     static KEY: OnceLock<Option<String>> = OnceLock::new();
     KEY.get_or_init(|| {
         // Try env var first.
-        if let Ok(k) = std::env::var("SEMANTIC_SCHOLAR_API_KEY") {
-            if !k.is_empty() {
-                return Some(k);
-            }
+        if let Ok(k) = std::env::var("SEMANTIC_SCHOLAR_API_KEY")
+            && !k.is_empty()
+        {
+            return Some(k);
         }
         // Try academic-papers-mcp config.
         let home = std::env::var("HOME").ok()?;
@@ -626,7 +636,7 @@ const S2_FIELDS: &str =
     "paperId,title,abstract,year,citationCount,url,venue,authors,publicationDate,openAccessPdf";
 
 async fn search_semantic_scholar(query: &str, max_results: usize) -> Result<String, String> {
-    let limit = max_results.min(20).max(1);
+    let limit = max_results.clamp(1, 20);
 
     // Try the public Graph API first.
     match search_s2_public(query, limit).await {
@@ -798,7 +808,12 @@ async fn search_s2_via_bff(query: &str, limit: usize) -> Result<String, String> 
         }
         if !e.abstract_text.is_empty() {
             let preview = if e.abstract_text.len() > 200 {
-                format!("{}...", &e.abstract_text[..200])
+                // Char-boundary safe slice — web abstracts carry UTF-8
+                // (em-dashes, smart quotes, non-Latin scripts) and a
+                // raw byte slice panics when a multi-byte glyph
+                // straddles the cap (slop_guard.rs hit this in prod).
+                let cap = e.abstract_text.floor_char_boundary(200);
+                format!("{}...", &e.abstract_text[..cap])
             } else {
                 e.abstract_text.clone()
             };

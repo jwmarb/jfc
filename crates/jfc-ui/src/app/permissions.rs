@@ -1,4 +1,4 @@
-use crate::types::{ToolCall, ToolKind};
+use crate::types::{ToolCall, ToolInput, ToolKind};
 
 /// Permission modes matching v126 claude-code. Controls how tool execution
 /// is gated — from fully interactive (Default) to fully autonomous (Bypass).
@@ -65,28 +65,45 @@ impl PermissionMode {
                 ToolKind::Read
                 | ToolKind::Glob
                 | ToolKind::Grep
+                | ToolKind::Search
+                | ToolKind::Lsp
+                | ToolKind::WebFetch
+                | ToolKind::WebSearch
+                | ToolKind::ServerWebSearch
+                | ToolKind::NotebookRead
                 | ToolKind::TaskCreate
                 | ToolKind::TaskUpdate
                 | ToolKind::TaskList
                 | ToolKind::TaskDone
+                | ToolKind::TaskStop
+                | ToolKind::TaskGet
+                | ToolKind::TaskValidate
                 | ToolKind::ToolSearch
                 | ToolKind::ToolSuggest
+                | ToolKind::CodeIndex
+                | ToolKind::GraphQuery
+                | ToolKind::RunCoverage
+                | ToolKind::MarketStatus
+                | ToolKind::CronList
                 | ToolKind::TeamCreate
                 | ToolKind::TeamDelete
                 | ToolKind::SendMessage
                 | ToolKind::ScratchpadRead
                 | ToolKind::ScratchpadWrite
+                | ToolKind::AskUserQuestion
+                | ToolKind::EnterPlanMode
                 // ExitPlanMode is the *only* way the agent can leave
                 // plan mode programmatically. Auto-approving it lets
                 // the model surface a plan whenever it's ready —
                 // mirrors v132's `ExitPlanMode` contract.
                 | ToolKind::ExitPlanMode => PermissionDecision::Approved,
                 ToolKind::Bash => {
-                    let cmd = tool.input.summary().to_lowercase();
-                    if is_readonly_bash(&cmd) {
-                        PermissionDecision::Approved
-                    } else {
-                        PermissionDecision::Denied("Plan mode: write operations blocked")
+                    let ToolInput::Bash { command, .. } = &tool.input else {
+                        return PermissionDecision::Denied("Plan mode: malformed bash input");
+                    };
+                    match super::shell_safety::classify_readonly_bash(command) {
+                        Ok(()) => PermissionDecision::Approved,
+                        Err(reason) => PermissionDecision::Denied(reason),
                     }
                 }
                 _ => PermissionDecision::Denied("Plan mode: write operations blocked"),
@@ -94,21 +111,43 @@ impl PermissionMode {
             Self::AcceptEdits => match tool.kind {
                 ToolKind::Write
                 | ToolKind::Edit
+                | ToolKind::MultiEdit
+                | ToolKind::SymbolEdit
                 | ToolKind::ApplyPatch
                 | ToolKind::Read
                 | ToolKind::Glob
                 | ToolKind::Grep
+                | ToolKind::Search
+                | ToolKind::Lsp
+                | ToolKind::WebFetch
+                | ToolKind::WebSearch
+                | ToolKind::ServerWebSearch
+                | ToolKind::NotebookRead
+                | ToolKind::NotebookEdit
                 | ToolKind::TaskCreate
                 | ToolKind::TaskUpdate
                 | ToolKind::TaskList
                 | ToolKind::TaskDone
+                | ToolKind::TaskStop
+                | ToolKind::TaskGet
+                | ToolKind::TaskValidate
                 | ToolKind::ToolSearch
                 | ToolKind::ToolSuggest
+                | ToolKind::CodeIndex
+                | ToolKind::GraphQuery
+                | ToolKind::RunCoverage
+                | ToolKind::MarketStatus
+                | ToolKind::CronList
                 | ToolKind::TeamCreate
                 | ToolKind::TeamDelete
                 | ToolKind::SendMessage
                 | ToolKind::ScratchpadRead
-                | ToolKind::ScratchpadWrite => PermissionDecision::Approved,
+                | ToolKind::ScratchpadWrite
+                | ToolKind::AskUserQuestion
+                | ToolKind::EnterPlanMode
+                | ToolKind::ExitPlanMode
+                | ToolKind::EnterWorktree
+                | ToolKind::ExitWorktree => PermissionDecision::Approved,
                 _ => PermissionDecision::NeedsPrompt,
             },
             Self::BypassPermissions => PermissionDecision::Approved,
@@ -123,46 +162,6 @@ pub enum PermissionDecision {
     Denied(&'static str),
     NeedsPrompt,
     NeedsClassifier,
-}
-
-/// Heuristic for read-only bash commands (used by Plan mode).
-pub(super) fn is_readonly_bash(cmd: &str) -> bool {
-    let first_word = cmd.split_whitespace().next().unwrap_or("");
-    matches!(
-        first_word,
-        "ls" | "cat"
-            | "head"
-            | "tail"
-            | "find"
-            | "grep"
-            | "rg"
-            | "fd"
-            | "wc"
-            | "file"
-            | "stat"
-            | "which"
-            | "whoami"
-            | "pwd"
-            | "echo"
-            | "date"
-            | "env"
-            | "printenv"
-            | "uname"
-            | "hostname"
-            | "id"
-            | "tree"
-            | "du"
-            | "df"
-            | "free"
-            | "ps"
-    ) || cmd.starts_with("git log")
-        || cmd.starts_with("git show")
-        || cmd.starts_with("git diff")
-        || cmd.starts_with("git status")
-        || cmd.starts_with("git branch")
-        || cmd.starts_with("cargo check")
-        || cmd.starts_with("cargo test")
-        || cmd.starts_with("cargo clippy")
 }
 
 #[derive(Clone, Copy, PartialEq)]

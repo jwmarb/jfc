@@ -86,6 +86,7 @@ struct ToolHeightCache {
 /// per-tool fingerprint cannot encode — e.g. a layout/cap constant in this
 /// module is altered. Width and display-state changes are already covered by
 /// the key, so they don't need explicit invalidation.
+#[allow(dead_code)]
 pub fn clear_tool_height_cache() {
     let mut c = TOOL_HEIGHT_CACHE
         .lock()
@@ -174,6 +175,17 @@ fn hash_tool_output_height_fields(output: &ToolOutput, h: &mut impl std::hash::H
             exit_code.hash(h);
         }
         ToolOutput::FileList(files) => files.hash(h),
+        ToolOutput::ServerToolResult { tool_kind, content } => {
+            tool_kind.wire_type().hash(h);
+            // Stringify the JSON for hashing — the rendered text is
+            // derived from this content via
+            // `format_server_tool_result_text_public`, so hashing the
+            // raw JSON keeps the cache key tight to what the
+            // renderer actually outputs.
+            if let Ok(s) = serde_json::to_string(content) {
+                s.hash(h);
+            }
+        }
         ToolOutput::Empty => {}
     }
 }
@@ -238,6 +250,7 @@ pub(super) fn tool_block_height(tool: &ToolCall, inner_w: usize) -> usize {
     1 + cont + tool_content_height_with_tool(tool, content_w)
 }
 
+#[allow(dead_code)]
 pub fn tool_block_height_pub(tool: &ToolCall, inner_w: usize) -> usize {
     tool_block_height(tool, inner_w)
 }

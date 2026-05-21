@@ -1,6 +1,6 @@
 use std::process::Stdio;
 
-use super::{collusion_detector, market_orchestrator, snapshot_event_sender};
+use super::registry::{collusion_detector, market_orchestrator, snapshot_event_sender};
 
 /// SwarmProvider impl for jfc-ui — delegates to the existing
 /// `worktrees` module. Each solver gets a worktree named
@@ -107,20 +107,20 @@ impl jfc_economy::reporting::SwarmProvider for EconomySwarmProvider {
 /// callback when the provider emits one, otherwise from a 4-chars-
 /// per-token byte estimate.
 pub(crate) struct EconomyAgentInvoker {
-    provider: std::sync::Arc<dyn crate::provider::Provider>,
-    model: crate::provider::ModelId,
+    provider: std::sync::Arc<dyn jfc_provider::Provider>,
+    model: jfc_provider::ModelId,
     /// Optional UI event channel — when set, every solver / validator
     /// invocation emits TaskStarted before streaming, AgentChunk for
     /// each text delta, and TaskCompleted/Failed at the end. This is
     /// what makes bounty subagents show up in the same fan UI / ctrl+X
     /// panel as regular Task-tool subagents. None is fine for tests.
-    event_tx: Option<tokio::sync::mpsc::Sender<crate::app::AppEvent>>,
+    event_tx: Option<tokio::sync::mpsc::Sender<crate::runtime::AppEvent>>,
 }
 
 impl EconomyAgentInvoker {
     pub fn new(
-        provider: std::sync::Arc<dyn crate::provider::Provider>,
-        model: crate::provider::ModelId,
+        provider: std::sync::Arc<dyn jfc_provider::Provider>,
+        model: jfc_provider::ModelId,
     ) -> Self {
         Self {
             provider,
@@ -142,8 +142,8 @@ impl EconomyAgentInvoker {
         max_tokens: u64,
         task_id: Option<&str>,
     ) -> Result<(String, u64), String> {
-        use crate::provider::*;
         use futures::StreamExt;
+        use jfc_provider::*;
         let opts = StreamOptions::new(self.model.clone())
             .system(system)
             .max_tokens(max_tokens.min(u32::MAX as u64) as u32);
@@ -163,12 +163,14 @@ impl EconomyAgentInvoker {
             match ev {
                 Ok(StreamEvent::TextDelta { delta, .. }) => {
                     if let (Some(tx), Some(id)) = (&self.event_tx, task_id) {
-                        let _ = tx
-                            .send(crate::app::AppEvent::AgentChunk {
-                                task_id: crate::ids::TaskId::from(id),
-                                text: delta.clone(),
-                            })
-                            .await;
+                        tx.send(crate::runtime::AppEvent::Task(
+                                crate::runtime::TaskEvent::AgentChunk {
+                                    task_id: crate::ids::TaskId::from(id),
+                                    text: delta.clone(),
+                                },
+                            ))
+                            .await
+                            .ok();
                     }
                     text.push_str(&delta);
                 }
@@ -186,16 +188,19 @@ impl EconomyAgentInvoker {
                     output_tokens = o as u64;
                     if let (Some(tx), Some(id)) = (&self.event_tx, task_id) {
                         // TaskProgress is non-critical; next progress update supersedes.
-                        let _ = tx.try_send(crate::app::AppEvent::TaskProgress {
-                            task_id: crate::ids::TaskId::from(id),
-                            last_tool: None,
-                            elapsed_ms: 0,
-                            tool_use_count: None,
-                            input_tokens: Some(i as u64),
-                            cache_read_tokens: None,
-                            cache_write_tokens: None,
-                            output_tokens: Some(o as u64),
-                        });
+                        tx.try_send(crate::runtime::AppEvent::Task(
+                            crate::runtime::TaskEvent::Progress {
+                                task_id: crate::ids::TaskId::from(id),
+                                last_tool: None,
+                                elapsed_ms: 0,
+                                tool_use_count: None,
+                                input_tokens: Some(i as u64),
+                                cache_read_tokens: None,
+                                cache_write_tokens: None,
+                                output_tokens: Some(o as u64),
+                            },
+                        ))
+                        .ok();
                     }
                 }
                 Ok(StreamEvent::Error { message }) => {
@@ -223,43 +228,56 @@ impl EconomyAgentInvoker {
             // try_send: lifecycle events are critical but rare (one per task
             // start), so a full buffer indicates the UI is genuinely overwhelmed
             // — log and continue rather than block this sync path.
-            if let Err(e) = tx.try_send(crate::app::AppEvent::TaskStarted {
-                task_id: crate::ids::TaskId::from(task_id),
-                description: description.to_owned(),
-                model_used: None,
-                max_input_tokens: None,
-                // Economy solver/validator agents run in-process via the
-                // same Task tool path as ordinary subagents.
-                is_detached: false,
-                // Economy agents aren't linked to a user-facing todo —
-                // they're spawned by the bounty market, not the task queue.
-                parent_task_id: None,
-            }) {
+            if let Err(e) = tx.try_send(crate::runtime::AppEvent::Task(
+                crate::runtime::TaskEvent::Started {
+                    task_id: crate::ids::TaskId::from(task_id),
+                    description: description.to_owned(),
+                    // Report the solver/validator model so the
+                    // BackgroundTask's `model_used` is populated. Without
+                    // it the per-progress token deltas this invoker emits
+                    // never roll into `app.usage_by_model` (the handler at
+                    // task.rs only credits usage when model_used is Some),
+                    // and the bounty's API spend stays invisible in the
+                    // status bar / cost panel — the billing blind spot.
+                    model_used: Some(self.model.as_str().to_owned()),
+                    max_input_tokens: None,
+                    // Economy solver/validator agents run in-process via the
+                    // same Task tool path as ordinary subagents.
+                    is_detached: false,
+                    // Economy agents aren't linked to a user-facing todo —
+                    // they're spawned by the bounty market, not the task queue.
+                    parent_task_id: None,
+                },
+            )) {
                 tracing::warn!(target: "jfc::tools", task_id, error = %e, "TaskStarted dropped: channel full");
             }
         }
     }
 
     fn emit_completed(&self, task_id: &str, summary: &str, elapsed_ms: u64) {
-        if let Some(tx) = &self.event_tx {
-            if let Err(e) = tx.try_send(crate::app::AppEvent::TaskCompleted {
-                task_id: crate::ids::TaskId::from(task_id),
-                summary: summary.to_owned(),
-                elapsed_ms,
-            }) {
-                tracing::warn!(target: "jfc::tools", task_id, error = %e, "TaskCompleted dropped: channel full");
-            }
+        if let Some(tx) = &self.event_tx
+            && let Err(e) = tx.try_send(crate::runtime::AppEvent::Task(
+                crate::runtime::TaskEvent::Completed {
+                    task_id: crate::ids::TaskId::from(task_id),
+                    summary: summary.to_owned(),
+                    elapsed_ms,
+                },
+            ))
+        {
+            tracing::warn!(target: "jfc::tools", task_id, error = %e, "TaskCompleted dropped: channel full");
         }
     }
 
     fn emit_failed(&self, task_id: &str, error: &str) {
-        if let Some(tx) = &self.event_tx {
-            if let Err(e) = tx.try_send(crate::app::AppEvent::TaskFailed {
-                task_id: crate::ids::TaskId::from(task_id),
-                error: error.to_owned(),
-            }) {
-                tracing::warn!(target: "jfc::tools", task_id, error = %e, "TaskFailed dropped: channel full");
-            }
+        if let Some(tx) = &self.event_tx
+            && let Err(e) = tx.try_send(crate::runtime::AppEvent::Task(
+                crate::runtime::TaskEvent::Failed {
+                    task_id: crate::ids::TaskId::from(task_id),
+                    error: error.to_owned(),
+                },
+            ))
+        {
+            tracing::warn!(target: "jfc::tools", task_id, error = %e, "TaskFailed dropped: channel full");
         }
     }
 }
@@ -284,81 +302,113 @@ impl jfc_economy::reporting::AgentInvoker for EconomyAgentInvoker {
         );
         self.emit_started(&task_id, &desc);
         let started_at = std::time::Instant::now();
-        let system = format!(
-            "You are a competitive solver agent in a code-bounty market. \
-             Your goal: produce a minimal, correct solution that satisfies \
-             the acceptance criteria. No filler — every token costs the \
-             bounty pool.\n\n\
-             OUTPUT FORMAT (mandatory):\n\
-             For each new or modified file, emit a block:\n\
-             ===FILE: <path relative to project root, OR absolute path \
-             if the bounty explicitly names one>===\n\
-             <full file contents>\n\
-             ===END===\n\n\
-             You may emit any number of blocks back-to-back. After all \
-             blocks, write one paragraph of explanation. If a unified \
-             diff is more natural for an existing repo, emit it inside \
-             a ```diff fence INSTEAD of FILE blocks.\n\n\
-             Acceptance criteria: {}",
+
+        // Build a TaskInput that runs the solver as a full agentic loop
+        // inside the assigned worktree.
+        let solver_prompt = format!(
+            "You are a competitive solver agent in a code-bounty market.\n\n\
+             Bounty: {}\n\n\
+             Description: {}\n\n\
+             Acceptance criteria: {}\n\n\
+             You have full access to Read, Write, Edit, Bash, Grep, and Glob tools. \
+             Use them to explore the codebase, understand the problem, implement \
+             the solution, and verify it compiles/passes tests. Work directly in the \
+             current directory — it is your isolated worktree.",
+            prompt.bounty_id,
+            prompt.bounty_description,
             prompt.acceptance_criteria,
         );
-        let user = format!(
-            "Bounty {} — {}\n\nProduce the solution now using the FILE \
-             block format described in the system prompt. Then a \
-             one-paragraph explanation.",
-            prompt.bounty_id, prompt.bounty_description
-        );
-        tracing::debug!(
+        let task_input = jfc_core::TaskInput {
+            description: desc.clone(),
+            prompt: solver_prompt,
+            subagent_type: Some("build".to_string()),
+            category: None,
+            run_in_background: false,
+            model: Some(self.model.as_str().to_string()),
+            name: Some(prompt.agent_id.0.clone()),
+            team_name: None,
+            mode: Some("default".to_string()),
+            isolation: None, // Worktree already created by SwarmProvider
+            parent_task_id: None,
+        };
+
+        tracing::info!(
             target: "jfc::ui::economy",
             agent = %prompt.agent_id.0,
             bounty_id = %prompt.bounty_id,
-            max_tokens = prompt.max_tokens,
-            "invoke_solver: streaming"
+            worktree = ?prompt.worktree,
+            "invoke_solver: dispatching agentic loop"
         );
-        match self
-            .one_shot(system, user, prompt.max_tokens, Some(&task_id))
-            .await
-        {
-            Ok((text, tokens)) => {
-                let (patch, explanation) = split_patch_and_explanation(&text);
-                let summary = format!("{} bytes patch, {} tokens", patch.len(), tokens);
-                let mut solution = jfc_economy::types::Solution {
-                    agent_id: prompt.agent_id,
-                    bounty_id: prompt.bounty_id.clone(),
-                    patch,
-                    explanation,
-                    self_assessment: 0.5,
-                    tokens_consumed: tokens,
-                    compiles: None,
-                    tests_pass: None,
-                    suspicious: false,
-                };
 
-                if let Some(worktree) = prompt.worktree.as_ref() {
-                    let verification =
-                        verify_bounty_solution(worktree, &prompt.bounty_id, &solution).await;
-                    solution.compiles = Some(verification.passed);
-                    solution.tests_pass = Some(verification.passed);
-                    solution.suspicious = !verification.passed;
-                    solution
-                        .explanation
-                        .push_str("\n\nMechanistic verification: ");
-                    solution.explanation.push_str(&verification.summary);
-                } else {
-                    solution.suspicious = true;
-                    solution.explanation.push_str(
-                        "\n\nMechanistic verification: no solver worktree was available; solution cannot be accepted automatically.",
-                    );
-                }
+        let result = super::subagent::execute_task(
+            &task_input,
+            self.provider.as_ref(),
+            self.model.clone(),
+            self.event_tx.as_ref(),
+            Some(&task_id),
+            None,
+            prompt.worktree.clone(),
+            None,
+            None,
+        )
+        .await;
 
-                self.emit_completed(&task_id, &summary, started_at.elapsed().as_millis() as u64);
-                Ok(solution)
-            }
-            Err(e) => {
-                self.emit_failed(&task_id, &e);
-                Err(e)
-            }
+        let elapsed_ms = started_at.elapsed().as_millis() as u64;
+
+        if result.is_error() {
+            self.emit_failed(&task_id, &result.output);
+            return Err(format!("Solver execution failed: {}", result.output));
         }
+
+        // Collect the solver's work as a git diff from the worktree
+        let patch = if let Some(ref wt_path) = prompt.worktree {
+            let diff_output = tokio::process::Command::new("git")
+                .args(["diff", "HEAD"])
+                .current_dir(wt_path)
+                .output()
+                .await
+                .ok();
+            diff_output
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        let tokens_estimate = (patch.len() as u64).div_ceil(4).max(100);
+        let mut solution = jfc_economy::types::Solution {
+            agent_id: prompt.agent_id,
+            bounty_id: prompt.bounty_id.clone(),
+            patch: patch.clone(),
+            explanation: result.output.clone(),
+            self_assessment: 0.8,
+            tokens_consumed: tokens_estimate,
+            compiles: None,
+            tests_pass: None,
+            suspicious: false,
+        };
+
+        // Mechanistically verify the solution in the worktree
+        if let Some(ref worktree) = prompt.worktree {
+            let verification =
+                verify_bounty_solution(worktree, &prompt.bounty_id, &solution).await;
+            solution.compiles = Some(verification.passed);
+            solution.tests_pass = Some(verification.passed);
+            solution.suspicious = !verification.passed;
+            solution
+                .explanation
+                .push_str("\n\nMechanistic verification: ");
+            solution.explanation.push_str(&verification.summary);
+        } else {
+            solution.suspicious = true;
+            solution.explanation.push_str(
+                "\n\nMechanistic verification: no solver worktree was available.",
+            );
+        }
+
+        let summary = format!("{} bytes patch", patch.len());
+        self.emit_completed(&task_id, &summary, elapsed_ms);
+        Ok(solution)
     }
 
     async fn invoke_validator(
@@ -447,8 +497,43 @@ impl jfc_economy::reporting::AgentInvoker for EconomyAgentInvoker {
             }
         }
     }
+
+    async fn adjudicate_test(
+        &self,
+        test_code: &str,
+        worktree: Option<&std::path::Path>,
+    ) -> bool {
+        let Some(wt_path) = worktree else {
+            return false;
+        };
+        // Write the validator's test to a temporary file inside the worktree
+        let test_dir = wt_path.join("tests");
+        let test_file = test_dir.join("_validator_adjudication_test.rs");
+        if std::fs::create_dir_all(&test_dir).is_err() {
+            return false;
+        }
+        if std::fs::write(&test_file, test_code).is_err() {
+            return false;
+        }
+        // Run cargo test against this specific test file
+        let result = tokio::process::Command::new("cargo")
+            .args(["test", "--test", "_validator_adjudication_test", "--", "--nocapture"])
+            .current_dir(wt_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await;
+        // Clean up the test file regardless of outcome
+        std::fs::remove_file(&test_file).ok();
+        // If cargo test exits non-zero, the flaw is proven
+        match result {
+            Ok(output) => !output.status.success(),
+            Err(_) => false,
+        }
+    }
 }
 
+#[cfg(test)]
 pub(crate) fn split_patch_and_explanation(text: &str) -> (String, String) {
     if let Some(start) = text.find("```diff").or_else(|| text.find("```")) {
         let after = &text[start..];
@@ -548,8 +633,8 @@ pub(crate) fn apply_winning_solution(
             summary: format!("Failed to create audit dir: {e}"),
         };
     }
-    let _ = std::fs::write(audit_dir.join("winner.patch"), &sol.patch);
-    let _ = std::fs::write(audit_dir.join("winner.md"), &sol.explanation);
+    std::fs::write(audit_dir.join("winner.patch"), &sol.patch).ok();
+    std::fs::write(audit_dir.join("winner.md"), &sol.explanation).ok();
     tracing::info!(
         target: "jfc::ui::bounty",
         bounty_id = %bounty_id,
@@ -713,6 +798,29 @@ pub(super) async fn verify_bounty_solution(
     bounty_id: &str,
     solution: &jfc_economy::types::Solution,
 ) -> MechanisticVerification {
+    // Charter enforcement: reject solutions that delete existing tests.
+    let deleted_tests = solution
+        .patch
+        .lines()
+        .filter(|l| l.starts_with('-') && l.contains("#[test]"))
+        .count();
+    if deleted_tests > 0 {
+        tracing::warn!(
+            target: "jfc::economy::charter",
+            agent = %solution.agent_id.0,
+            bounty_id,
+            deleted_tests,
+            "Solution rejected: patch deletes existing test annotations (Charter: TestDeletion)"
+        );
+        return MechanisticVerification {
+            passed: false,
+            summary: format!(
+                "Charter violation (TestDeletion): patch deletes {} existing #[test] annotation(s).",
+                deleted_tests
+            ),
+        };
+    }
+
     let applied = apply_winning_solution(worktree, bounty_id, Some(solution));
     let summary = applied.summary.to_lowercase();
     if applied.files.is_empty()
@@ -900,10 +1008,8 @@ pub(crate) fn parse_validator_output(text: &str) -> (Option<String>, f32, Option
                     *conf = n.clamp(0.0, 1.0);
                 }
             }
-            Some("TEST") => {
-                if !v.is_empty() && !v.eq_ignore_ascii_case("none") {
-                    *test = Some(v);
-                }
+            Some("TEST") if !v.is_empty() && !v.eq_ignore_ascii_case("none") => {
+                *test = Some(v);
             }
             _ => {}
         }
@@ -945,7 +1051,23 @@ pub(crate) fn parse_validator_output(text: &str) -> (Option<String>, f32, Option
 }
 
 pub(crate) async fn market_report_string() -> Result<String, String> {
-    let orch = market_orchestrator().lock().await;
+    // Try-lock instead of blocking: when a bounty cycle is running it
+    // holds the orchestrator mutex for its full multi-minute duration
+    // (solvers + validators round-trip through the LLM under the same
+    // lock). Blocking here would freeze every caller — `/market`, the
+    // model's own `market_status` tool — until the cycle finishes.
+    // Report busy state instead so the user / model can retry.
+    let orch = match market_orchestrator().try_lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return Ok(
+                "Agent economy is busy executing a bounty cycle. \
+                 Spend, trust, and ledger figures will refresh once the cycle \
+                 completes — re-run /market in a moment."
+                    .to_owned(),
+            );
+        }
+    };
     let detector = collusion_detector()
         .lock()
         .map_err(|e| format!("collusion detector mutex poisoned: {e}"))?;

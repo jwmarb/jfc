@@ -13,16 +13,20 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
 
-use crate::app::AppEvent;
 use crate::context::ReadDedupCache;
-use crate::tasks::TaskStore;
-use crate::tools::{self, ExecutionResult};
+use crate::runtime::{AppEvent, ExecutionResult, ToolEvent};
+use crate::tools;
 use crate::types::{ToolCall, ToolKind};
+use jfc_session::TaskStore;
 
 /// Maximum number of concurrency-safe tools that run in a single parallel batch.
 pub const MAX_CONCURRENCY: usize = 10;
 
 /// A scheduled batch of tool calls.
+// `Sequential(ToolCall)` is fatter than `Parallel(Vec<ToolCall>)` (Vec is a
+// 24-byte handle). Boxing would shrink the enum but every batch lives only
+// long enough to run once, so this is a non-issue in practice.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ToolBatch {
     /// Tools that can execute simultaneously (Read, Glob, Grep, Search).
@@ -73,7 +77,7 @@ pub fn schedule_tools(calls: Vec<ToolCall>) -> Vec<ToolBatch> {
         if buf.is_empty() {
             return;
         }
-        for chunk in buf.drain(..).collect::<Vec<_>>().chunks(MAX_CONCURRENCY) {
+        for chunk in std::mem::take(buf).chunks(MAX_CONCURRENCY) {
             out.push(ToolBatch::Parallel(chunk.to_vec()));
         }
     };
@@ -112,11 +116,11 @@ pub struct ToolExecution {
     pub result: ExecutionResult,
 }
 
-/// Execute all batches in order, sending `ToolResult` events for each completion.
+/// Execute all batches in order, sending `ToolEvent::Result` events for each completion.
 ///
 /// Parallel batches spawn up to `MAX_CONCURRENCY` tasks and join them.
 /// Sequential batches run one at a time. The `tx` channel is used to send
-/// per-tool `AppEvent::ToolResult` events as each tool finishes.
+/// per-tool `AppEvent::Tool(ToolEvent::Result)` events as each tool finishes.
 pub async fn execute_batches(
     batches: Vec<ToolBatch>,
     tx: &mpsc::Sender<AppEvent>,
@@ -185,10 +189,10 @@ pub async fn execute_batches(
                                 "tool completed",
                             );
                             if tx
-                                .send(AppEvent::ToolResult {
+                                .send(AppEvent::Tool(ToolEvent::Result {
                                     tool_id: id.clone(),
                                     result: exec.result.clone(),
-                                })
+                                }))
                                 .await
                                 .is_err()
                             {
@@ -209,6 +213,18 @@ pub async fn execute_batches(
                                 error = %err,
                                 "parallel tool task panicked or was cancelled",
                             );
+                            // Emit a synthetic failure result so the agentic
+                            // loop doesn't stall. Without this the tool stays
+                            // in Running status forever and
+                            // should_continue_loop returns false.
+                            let _ = tx
+                                .send(AppEvent::Tool(ToolEvent::Result {
+                                    tool_id: id.clone(),
+                                    result: crate::tools::ExecutionResult::failure(format!(
+                                        "Tool panicked: {err}"
+                                    )),
+                                }))
+                                .await;
                         }
                     }
                 }
@@ -241,10 +257,10 @@ pub async fn execute_batches(
                     "tool completed",
                 );
                 if tx
-                    .send(AppEvent::ToolResult {
+                    .send(AppEvent::Tool(ToolEvent::Result {
                         tool_id: id.clone(),
                         result: result.clone(),
-                    })
+                    }))
                     .await
                     .is_err()
                 {
@@ -283,6 +299,7 @@ mod tests {
             display: crate::types::ToolDisplayState::DEFAULT,
             elapsed_ms: None,
             started_at: None,
+            thought_signature: None,
         }
     }
 
@@ -452,6 +469,7 @@ mod tests {
             display: crate::types::ToolDisplayState::DEFAULT,
             elapsed_ms: None,
             started_at: None,
+            thought_signature: None,
         }
     }
 
@@ -468,6 +486,7 @@ mod tests {
             display: crate::types::ToolDisplayState::DEFAULT,
             elapsed_ms: None,
             started_at: None,
+            thought_signature: None,
         }
     }
 
@@ -495,7 +514,7 @@ mod tests {
         drop(tx);
         let mut got = 0usize;
         while let Some(ev) = rx.recv().await {
-            if matches!(ev, AppEvent::ToolResult { .. }) {
+            if matches!(ev, AppEvent::Tool(ToolEvent::Result { .. })) {
                 got += 1;
             }
         }
@@ -528,7 +547,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         drop(tx);
         let ev = rx.recv().await.expect("event present");
-        assert!(matches!(ev, AppEvent::ToolResult { .. }));
+        assert!(matches!(ev, AppEvent::Tool(ToolEvent::Result { .. })));
     }
 
     // Robust: empty batches list returns empty results without contacting
@@ -561,6 +580,6 @@ mod tests {
         assert_eq!(results.len(), 1);
         drop(tx);
         let ev = rx.recv().await.expect("got result");
-        assert!(matches!(ev, AppEvent::ToolResult { .. }));
+        assert!(matches!(ev, AppEvent::Tool(ToolEvent::Result { .. })));
     }
 }

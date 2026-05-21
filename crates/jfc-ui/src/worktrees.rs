@@ -154,6 +154,7 @@ pub fn parse_porcelain_output(s: &str) -> Vec<WorktreeInfo> {
 
 /// List all worktrees registered with the repo at `repo_root`. Shells out to
 /// `git worktree list --porcelain` — not unit-tested; see module docs.
+#[allow(dead_code)]
 pub fn list_worktrees(repo_root: &Path) -> Result<Vec<WorktreeInfo>, String> {
     tracing::debug!(target: "jfc::worktrees", ?repo_root, "list_worktrees");
     let output = Command::new("git")
@@ -204,6 +205,7 @@ pub async fn list_worktrees_async(repo_root: &Path) -> Result<Vec<WorktreeInfo>,
 /// Create `<repo_root>/.jfc-worktrees/<name>` checking out a fresh branch
 /// `jfc/<name>`. Validates the name first; surfaces git's stderr on failure.
 /// Shells out — not unit-tested; see module docs.
+#[allow(dead_code)]
 pub fn create_worktree(repo_root: &Path, name: &str) -> Result<WorktreeInfo, String> {
     tracing::info!(target: "jfc::worktrees", ?repo_root, name, "create_worktree");
     validate_name(name)?;
@@ -308,6 +310,196 @@ pub async fn remove_worktree_async(repo_root: &Path, name: &str) -> Result<(), S
         return Err(format!("`git worktree remove` failed: {}", stderr.trim()));
     }
     tracing::info!(target: "jfc::worktrees", name, "remove_worktree_async ok");
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tmux integration for worktree agents
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Tmux session naming convention for jfc worktree agents.
+#[allow(dead_code)]
+pub fn tmux_session_name(agent_name: &str) -> String {
+    format!("jfc-{}", agent_name.replace(' ', "-").to_lowercase())
+}
+
+/// Check if tmux is available on the system.
+#[allow(dead_code)]
+pub fn tmux_available() -> bool {
+    Command::new("tmux").arg("-V").output().is_ok()
+}
+
+/// Create a tmux session for a worktree agent.
+/// The session runs in the worktree directory and shows the agent's log.
+#[allow(dead_code)]
+pub fn create_tmux_session(agent_name: &str, worktree_path: &Path) -> Result<String, String> {
+    let session_name = tmux_session_name(agent_name);
+
+    // Check if session already exists
+    let check = Command::new("tmux")
+        .args(["has-session", "-t", &session_name])
+        .output()
+        .map_err(|e| format!("tmux not available: {e}"))?;
+
+    if check.status.success() {
+        return Err(format!("tmux session '{session_name}' already exists"));
+    }
+
+    // Create new detached session in the worktree directory
+    let result = Command::new("tmux")
+        .args([
+            "new-session",
+            "-d", // detached
+            "-s",
+            &session_name, // session name
+            "-c",
+            &worktree_path.to_string_lossy(), // working directory
+        ])
+        .output()
+        .map_err(|e| format!("Failed to create tmux session: {e}"))?;
+
+    if !result.status.success() {
+        return Err(format!(
+            "tmux new-session failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        ));
+    }
+
+    // Set status bar to show agent info
+    let _ = Command::new("tmux")
+        .args([
+            "set-option",
+            "-t",
+            &session_name,
+            "status-left",
+            &format!(" 🤖 {agent_name} "),
+        ])
+        .output();
+
+    let _ = Command::new("tmux")
+        .args([
+            "set-option",
+            "-t",
+            &session_name,
+            "status-style",
+            "bg=#1a1b26,fg=#7aa2f7",
+        ])
+        .output();
+
+    Ok(session_name)
+}
+
+/// Create a split pane in an existing tmux session for log tailing.
+#[allow(dead_code)]
+pub fn tmux_add_log_pane(session_name: &str, log_path: &Path) -> Result<(), String> {
+    let result = Command::new("tmux")
+        .args([
+            "split-window",
+            "-t",
+            session_name,
+            "-v", // vertical split
+            "-l",
+            "30%", // 30% height for logs
+            "-d",  // don't switch focus
+            &format!("tail -f {}", log_path.to_string_lossy()),
+        ])
+        .output()
+        .map_err(|e| format!("Failed to split tmux pane: {e}"))?;
+
+    if !result.status.success() {
+        return Err(format!(
+            "tmux split-window failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        ));
+    }
+    Ok(())
+}
+
+/// Attach to a tmux session (blocks until detach).
+#[allow(dead_code)]
+pub fn tmux_attach(session_name: &str) -> Result<(), String> {
+    let result = Command::new("tmux")
+        .args(["attach-session", "-t", session_name])
+        .status()
+        .map_err(|e| format!("Failed to attach: {e}"))?;
+
+    if !result.success() {
+        return Err("tmux attach failed".to_string());
+    }
+    Ok(())
+}
+
+/// List all jfc-related tmux sessions.
+#[allow(dead_code)]
+pub fn list_tmux_sessions() -> Result<Vec<String>, String> {
+    let output = Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+        .map_err(|e| format!("tmux not available: {e}"))?;
+
+    if !output.status.success() {
+        // No server running = no sessions
+        return Ok(Vec::new());
+    }
+
+    let sessions: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|s| s.starts_with("jfc-"))
+        .map(String::from)
+        .collect();
+
+    Ok(sessions)
+}
+
+/// Kill a tmux session.
+#[allow(dead_code)]
+pub fn kill_tmux_session(session_name: &str) -> Result<(), String> {
+    let result = Command::new("tmux")
+        .args(["kill-session", "-t", session_name])
+        .output()
+        .map_err(|e| format!("Failed to kill session: {e}"))?;
+
+    if !result.status.success() {
+        return Err(format!(
+            "tmux kill-session failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        ));
+    }
+    Ok(())
+}
+
+/// Create a full worktree agent setup: worktree + tmux session + log pane.
+#[allow(dead_code)]
+pub fn create_agent_worktree_with_tmux(
+    repo_root: &Path,
+    agent_name: &str,
+    log_path: Option<&Path>,
+) -> Result<(WorktreeInfo, String), String> {
+    // Create the worktree
+    let worktree = create_worktree(repo_root, agent_name)?;
+
+    // Create tmux session in the worktree
+    let session_name = create_tmux_session(agent_name, Path::new(&worktree.path))?;
+
+    // Add log pane if log path provided
+    if let Some(log) = log_path {
+        let _ = tmux_add_log_pane(&session_name, log);
+    }
+
+    Ok((worktree, session_name))
+}
+
+/// Clean up agent worktree + tmux session.
+#[allow(dead_code)]
+pub fn cleanup_agent_worktree_with_tmux(repo_root: &Path, agent_name: &str) -> Result<(), String> {
+    let session_name = tmux_session_name(agent_name);
+
+    // Kill tmux session (ignore errors — might not exist)
+    let _ = kill_tmux_session(&session_name);
+
+    // Remove worktree
+    remove_worktree(repo_root, agent_name)?;
+
     Ok(())
 }
 
@@ -572,185 +764,4 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Tmux integration for worktree agents
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Tmux session naming convention for jfc worktree agents.
-pub fn tmux_session_name(agent_name: &str) -> String {
-    format!("jfc-{}", agent_name.replace(' ', "-").to_lowercase())
-}
-
-/// Check if tmux is available on the system.
-pub fn tmux_available() -> bool {
-    Command::new("tmux").arg("-V").output().is_ok()
-}
-
-/// Create a tmux session for a worktree agent.
-/// The session runs in the worktree directory and shows the agent's log.
-pub fn create_tmux_session(agent_name: &str, worktree_path: &Path) -> Result<String, String> {
-    let session_name = tmux_session_name(agent_name);
-
-    // Check if session already exists
-    let check = Command::new("tmux")
-        .args(["has-session", "-t", &session_name])
-        .output()
-        .map_err(|e| format!("tmux not available: {e}"))?;
-
-    if check.status.success() {
-        return Err(format!("tmux session '{session_name}' already exists"));
-    }
-
-    // Create new detached session in the worktree directory
-    let result = Command::new("tmux")
-        .args([
-            "new-session",
-            "-d", // detached
-            "-s",
-            &session_name, // session name
-            "-c",
-            &worktree_path.to_string_lossy(), // working directory
-        ])
-        .output()
-        .map_err(|e| format!("Failed to create tmux session: {e}"))?;
-
-    if !result.status.success() {
-        return Err(format!(
-            "tmux new-session failed: {}",
-            String::from_utf8_lossy(&result.stderr)
-        ));
-    }
-
-    // Set status bar to show agent info
-    let _ = Command::new("tmux")
-        .args([
-            "set-option",
-            "-t",
-            &session_name,
-            "status-left",
-            &format!(" 🤖 {agent_name} "),
-        ])
-        .output();
-
-    let _ = Command::new("tmux")
-        .args([
-            "set-option",
-            "-t",
-            &session_name,
-            "status-style",
-            "bg=#1a1b26,fg=#7aa2f7",
-        ])
-        .output();
-
-    Ok(session_name)
-}
-
-/// Create a split pane in an existing tmux session for log tailing.
-pub fn tmux_add_log_pane(session_name: &str, log_path: &Path) -> Result<(), String> {
-    let result = Command::new("tmux")
-        .args([
-            "split-window",
-            "-t",
-            session_name,
-            "-v", // vertical split
-            "-l",
-            "30%", // 30% height for logs
-            "-d",  // don't switch focus
-            &format!("tail -f {}", log_path.to_string_lossy()),
-        ])
-        .output()
-        .map_err(|e| format!("Failed to split tmux pane: {e}"))?;
-
-    if !result.status.success() {
-        return Err(format!(
-            "tmux split-window failed: {}",
-            String::from_utf8_lossy(&result.stderr)
-        ));
-    }
-    Ok(())
-}
-
-/// Attach to a tmux session (blocks until detach).
-pub fn tmux_attach(session_name: &str) -> Result<(), String> {
-    let result = Command::new("tmux")
-        .args(["attach-session", "-t", session_name])
-        .status()
-        .map_err(|e| format!("Failed to attach: {e}"))?;
-
-    if !result.success() {
-        return Err("tmux attach failed".to_string());
-    }
-    Ok(())
-}
-
-/// List all jfc-related tmux sessions.
-pub fn list_tmux_sessions() -> Result<Vec<String>, String> {
-    let output = Command::new("tmux")
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output()
-        .map_err(|e| format!("tmux not available: {e}"))?;
-
-    if !output.status.success() {
-        // No server running = no sessions
-        return Ok(Vec::new());
-    }
-
-    let sessions: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|s| s.starts_with("jfc-"))
-        .map(String::from)
-        .collect();
-
-    Ok(sessions)
-}
-
-/// Kill a tmux session.
-pub fn kill_tmux_session(session_name: &str) -> Result<(), String> {
-    let result = Command::new("tmux")
-        .args(["kill-session", "-t", session_name])
-        .output()
-        .map_err(|e| format!("Failed to kill session: {e}"))?;
-
-    if !result.status.success() {
-        return Err(format!(
-            "tmux kill-session failed: {}",
-            String::from_utf8_lossy(&result.stderr)
-        ));
-    }
-    Ok(())
-}
-
-/// Create a full worktree agent setup: worktree + tmux session + log pane.
-pub fn create_agent_worktree_with_tmux(
-    repo_root: &Path,
-    agent_name: &str,
-    log_path: Option<&Path>,
-) -> Result<(WorktreeInfo, String), String> {
-    // Create the worktree
-    let worktree = create_worktree(repo_root, agent_name)?;
-
-    // Create tmux session in the worktree
-    let session_name = create_tmux_session(agent_name, Path::new(&worktree.path))?;
-
-    // Add log pane if log path provided
-    if let Some(log) = log_path {
-        let _ = tmux_add_log_pane(&session_name, log);
-    }
-
-    Ok((worktree, session_name))
-}
-
-/// Clean up agent worktree + tmux session.
-pub fn cleanup_agent_worktree_with_tmux(repo_root: &Path, agent_name: &str) -> Result<(), String> {
-    let session_name = tmux_session_name(agent_name);
-
-    // Kill tmux session (ignore errors — might not exist)
-    let _ = kill_tmux_session(&session_name);
-
-    // Remove worktree
-    remove_worktree(repo_root, agent_name)?;
-
-    Ok(())
 }

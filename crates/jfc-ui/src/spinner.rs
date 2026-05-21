@@ -134,10 +134,9 @@ pub fn glimmer_index(elapsed: Duration, verb_width: usize, tick_ms: u64) -> i32 
 /// 6-frame spinner cycle. Matches v126's `nAH()` default (cli.js:170248).
 pub const FRAMES: &[&str] = &["·", "✢", "*", "✶", "✻", "✽"];
 
-/// Curated subset of v126's verb list (cli.js:233823-234022). The full set
-/// is 177 entries; we keep a representative ~32 so the rotation feels lively
-/// without piling on novelty words. All verbs end without a suffix — the
-/// `…` ellipsis is appended at format time.
+/// Present-tense verb pool — expanded toward cli.js v143's `iD6` array
+/// (~100 entries). Cycled in 5-second buckets so the same word stays on
+/// screen long enough to read but the spinner doesn't feel stuck.
 pub const VERBS: &[&str] = &[
     "Fermenting",
     "Pondering",
@@ -171,10 +170,83 @@ pub const VERBS: &[&str] = &[
     "Auditing",
     "Reasoning",
     "Investigating",
+    "Accomplishing",
+    "Brainstorming",
+    "Cogitating",
+    "Computing",
+    "Conjuring",
+    "Constructing",
+    "Crunching",
+    "Deliberating",
+    "Designing",
+    "Divining",
+    "Drafting",
+    "Dreaming",
+    "Engineering",
+    "Envisioning",
+    "Exploring",
+    "Extrapolating",
+    "Fashioning",
+    "Figuring",
+    "Finessing",
+    "Formulating",
+    "Generating",
+    "Germinating",
+    "Hatching",
+    "Hypothesizing",
+    "Iterating",
+    "Kneading",
+    "Loading",
+    "Manifesting",
+    "Moonwalking",
+    "Noodling",
+    "Optimizing",
+    "Orchestrating",
+    "Percolating",
+    "Piecing",
+    "Planning",
+    "Processing",
+    "Prototyping",
+    "Puzzling",
+    "Quilting",
+    "Refining",
+    "Researching",
+    "Resolving",
+    "Sautéing",
+    "Scheming",
+    "Spinning",
+    "Strategizing",
+    "Structuring",
+    "Studying",
+    "Stitching",
+    "Steeping",
+    "Surveying",
+    "Tessellating",
+    "Tracing",
+    "Translating",
+    "Unraveling",
+    "Working",
+];
+
+/// Past-tense verbs for finished agents. Mirrors cli.js v143's `rD6` array
+/// so completed sub-agent rows in the fan read with a finished tone ("Baked
+/// for 1m 5s") instead of stale present-tense ("Fermenting").
+#[allow(dead_code)]
+pub const VERBS_PAST: &[&str] = &[
+    "Baked",
+    "Brewed",
+    "Churned",
+    "Cogitated",
+    "Cooked",
+    "Crunched",
+    "Sautéed",
+    "Simmered",
+    "Worked",
+    "Wrought",
 ];
 
 /// Picks a frame index from a tick counter. Caller is expected to bump the
-/// tick on every redraw — typically every 80ms (one `AppEvent::Tick`).
+/// tick on every redraw — typically every 80ms (one `UiEvent::Tick`).
 pub fn frame_for(tick: usize) -> &'static str {
     FRAMES[tick % FRAMES.len()]
 }
@@ -186,6 +258,16 @@ pub fn frame_for(tick: usize) -> &'static str {
 pub fn verb_for(elapsed: Duration) -> &'static str {
     let bucket = (elapsed.as_secs() / 5) as usize;
     VERBS[bucket % VERBS.len()]
+}
+
+/// Pick a past-tense verb deterministically from a task-id-ish seed.
+/// Completed agents in the fan row read "Baked for 1m 5s" instead of a
+/// stale present-tense "Fermenting" — matches cli.js v143's `rD6`/`XgH()`
+/// pair where each task captures its own past verb at completion.
+#[allow(dead_code)]
+pub fn verb_past_for(seed: &str) -> &'static str {
+    let h: usize = seed.bytes().map(|b| b as usize).sum();
+    VERBS_PAST[h % VERBS_PAST.len()]
 }
 
 /// Format an elapsed Duration as `XmYs` or `Xs`. Mirrors v126 `h4()`
@@ -232,6 +314,19 @@ pub fn stall_status(time_since_last_token: Duration) -> Option<&'static str> {
         Some("warming up")
     } else {
         None
+    }
+}
+
+/// User-facing stream liveness chip. Token counts tell us how much has
+/// arrived; this tells us whether the SSE wire is still moving right now.
+pub fn stream_activity_status(time_since_last_stream_event: Duration) -> String {
+    let secs = time_since_last_stream_event.as_secs();
+    if secs <= 1 {
+        "stream active".to_string()
+    } else if secs < 10 {
+        format!("stream {secs}s ago")
+    } else {
+        format!("stream idle {}", fmt_elapsed(time_since_last_stream_event))
     }
 }
 
@@ -355,6 +450,7 @@ pub fn status_segments(
     elapsed: Duration,
     output_tokens: u64,
     time_since_last_token: Duration,
+    time_since_last_stream_event: Option<Duration>,
     thinking: Option<ThinkingStatus>,
 ) -> StatusSegments {
     let mut parts: Vec<String> = vec![fmt_elapsed(elapsed)];
@@ -367,6 +463,9 @@ pub fn status_segments(
                 parts.push(format!("{:.0} tok/s", rate));
             }
         }
+    }
+    if let Some(d) = time_since_last_stream_event {
+        parts.push(stream_activity_status(d));
     }
     match thinking {
         Some(ThinkingStatus::Live) => {
@@ -403,11 +502,13 @@ pub fn status_segments(
     }
 }
 
+#[allow(dead_code)]
 pub fn format_status(
     tick: usize,
     elapsed: Duration,
     output_tokens: u64,
     time_since_last_token: Duration,
+    time_since_last_stream_event: Option<Duration>,
     thinking: Option<ThinkingStatus>,
 ) -> String {
     let mut parts: Vec<String> = vec![fmt_elapsed(elapsed)];
@@ -425,6 +526,9 @@ pub fn format_status(
                 parts.push(format!("{:.0} tok/s", rate));
             }
         }
+    }
+    if let Some(d) = time_since_last_stream_event {
+        parts.push(stream_activity_status(d));
     }
     // Thinking signal beats stall_status while live (mid-reasoning the
     // wire is silent for tens of seconds and the user would otherwise
@@ -580,11 +684,13 @@ mod tests {
             Duration::from_secs(310),
             14_600,
             Duration::from_secs(70),
+            Some(Duration::from_secs(0)),
             None,
         );
         assert!(s.contains("…"), "verb ellipsis missing: {s}");
         assert!(s.contains("5m 10s"), "elapsed missing: {s}");
         assert!(s.contains("14k tokens"), "token line missing: {s}");
+        assert!(s.contains("stream active"), "stream liveness missing: {s}");
         assert!(
             s.contains("almost done thinking"),
             "stall hint missing: {s}"
@@ -593,7 +699,14 @@ mod tests {
 
     #[test]
     fn format_status_omits_tokens_when_zero_robust() {
-        let s = format_status(0, Duration::from_secs(3), 0, Duration::from_secs(0), None);
+        let s = format_status(
+            0,
+            Duration::from_secs(3),
+            0,
+            Duration::from_secs(0),
+            None,
+            None,
+        );
         assert!(
             !s.contains("tokens"),
             "should hide token suffix when 0: {s}"
@@ -603,7 +716,14 @@ mod tests {
 
     #[test]
     fn format_status_omits_stall_when_fresh_robust() {
-        let s = format_status(0, Duration::from_secs(5), 100, Duration::from_secs(2), None);
+        let s = format_status(
+            0,
+            Duration::from_secs(5),
+            100,
+            Duration::from_secs(2),
+            None,
+            None,
+        );
         assert!(
             !s.contains("thinking"),
             "fresh stream shouldn't say 'thinking': {s}"
@@ -618,9 +738,14 @@ mod tests {
             Duration::from_secs(20),
             500,
             Duration::from_secs(20),
+            Some(Duration::from_secs(20)),
             Some(ThinkingStatus::Live),
         );
         assert!(s.contains("thinking"), "expected live thinking: {s}");
+        assert!(
+            s.contains("stream idle 20s"),
+            "live thinking should expose stream idleness: {s}"
+        );
         // While live, we suppress stall messages so a 20s gap doesn't
         // double-display "warming up · thinking".
         assert!(
@@ -638,6 +763,7 @@ mod tests {
             Duration::from_secs(60),
             5_000,
             Duration::from_secs(0),
+            Some(Duration::from_secs(1)),
             Some(ThinkingStatus::Done(Duration::from_secs(12))),
         );
         assert!(s.contains("thought for 12s"), "expected duration: {s}");
@@ -652,6 +778,7 @@ mod tests {
             Duration::from_secs(5),
             100,
             Duration::from_secs(0),
+            None,
             Some(ThinkingStatus::Done(Duration::from_millis(400))),
         );
         assert!(s.contains("thought for 1s"), "expected 1s floor: {s}");

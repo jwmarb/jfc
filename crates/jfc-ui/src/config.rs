@@ -29,7 +29,9 @@
 //! routed to the Anthropic API, yielding a 404).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
@@ -114,6 +116,12 @@ pub struct Config {
     /// Valid range: 100_000–1_000_000. When None, uses the model's reported window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_compact_window: Option<u32>,
+    /// Custom instructions appended to the compaction system prompt.
+    /// Lets users steer what the summary preserves (e.g. "focus on code
+    /// changes", "include test output verbatim", "preserve file paths").
+    /// Mirrors CC 2.1.144's "Additional Instructions:" appendage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_instructions: Option<String>,
     /// User-configurable shell hooks. Maps event names to lists of commands.
     ///
     /// Example in `jfc.toml`:
@@ -159,6 +167,7 @@ impl Default for Config {
             session_cost_budget_usd: None,
             auto_compact_enabled: default_auto_compact_enabled(),
             auto_compact_window: None,
+            compact_instructions: None,
             hooks: None,
         }
     }
@@ -288,20 +297,8 @@ pub struct ArgusAutoReviewConfig {
     pub model: Option<String>,
 }
 
-/// MCP server definition.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct McpServerConfig {
-    #[serde(rename = "type", default)]
-    pub server_type: Option<String>,
-    #[serde(default)]
-    pub command: Option<String>,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-    #[serde(default)]
-    pub url: Option<String>,
-}
+/// Re-export from jfc-mcp so existing callsites keep working.
+pub use jfc_mcp::McpServerConfig;
 
 /// Experimental feature flags.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -374,18 +371,10 @@ pub mod feature_config {
 
     #[derive(Debug, Clone, Deserialize)]
     #[serde(default)]
+    #[derive(Default)]
     pub struct HooksConfig {
         pub enabled: bool,
         pub comment_check: CommentCheckConfig,
-    }
-
-    impl Default for HooksConfig {
-        fn default() -> Self {
-            Self {
-                enabled: false,
-                comment_check: CommentCheckConfig::default(),
-            }
-        }
     }
 
     #[derive(Debug, Clone, Deserialize)]
@@ -541,7 +530,32 @@ pub struct AgentConfig {
     /// Complete replacement system prompt (overrides default).
     #[serde(default)]
     pub prompt: Option<String>,
-    /// OpenAI reasoning effort: "low", "medium", "high".
+    /// Reasoning effort: "low" | "medium" | "high" | "xhigh" | "max".
+    ///
+    /// Applied at startup by `resolve_effort_for_model` with this
+    /// precedence: `[agents.<exact-model-id>]` → `[agents.<bare-id>]`
+    /// → `[default]`. Anthropic + OAuth providers send this as the
+    /// `reasoning_effort` API param.
+    ///
+    /// **OpenWebUI**: this field is **stripped** by the OWUI provider
+    /// because the proxy forwards it verbatim to whatever upstream
+    /// backend it's fronting (Bedrock, OpenAI-Azure, etc.) and backends
+    /// that don't accept it 500. To override per-model when you know
+    /// the backend handles it, set
+    /// `[agents."<model>"].provider_options.reasoning_effort = "high"` —
+    /// `provider_options` bypass the strip.
+    ///
+    /// Example pinning effort per model:
+    /// ```toml
+    /// [default]
+    /// reasoning_effort = "high"  # fallback for everything
+    ///
+    /// [agents."anthropic/claude-opus-4-7"]
+    /// reasoning_effort = "max"   # think hard on opus
+    ///
+    /// [agents."claude-haiku-4"]
+    /// reasoning_effort = "low"   # haiku stays fast
+    /// ```
     #[serde(default)]
     pub reasoning_effort: Option<String>,
     /// Sampling parameter (0.0 - 1.0).
@@ -586,6 +600,7 @@ pub enum FallbackModel {
 }
 
 impl FallbackModel {
+    #[allow(dead_code)]
     pub fn model_id(&self) -> &str {
         match self {
             Self::Simple(s) => s,
@@ -610,23 +625,57 @@ pub fn config_path() -> PathBuf {
     path
 }
 
-/// Load `~/.config/jfc/config.toml`, or return `Config::default()` on any
-/// failure (missing file, permission error, parse error). On parse errors we
-/// log a warning via `tracing::warn!` so the user sees their typo'd file is
-/// being silently ignored instead of dying mid-startup with a panic.
-///
-/// **Not unit-tested:** this function reads the live filesystem. Pure parsing
-/// is exercised through `Config`'s `Deserialize` impl in the test module
-/// below — feed it a string with `toml::from_str::<Config>` and verify the
-/// fields land. Filesystem-level integration is left to manual testing /
-/// the eventual startup integration ticket.
-pub fn load() -> Config {
-    let path = config_path();
-    tracing::info!(target: "jfc::config", path = %path.display(), "loading config");
-    let raw = match std::fs::read_to_string(&path) {
+/// One slot in the parse cache. Holds the path we cached for, the file's
+/// last-observed mtime, and the parsed `Config`. A missing/unparseable file
+/// is cached as `mtime = None` so we don't re-read+re-parse a known-bad file
+/// 50 times/sec either.
+#[derive(Clone)]
+struct Cached {
+    path: PathBuf,
+    mtime: Option<SystemTime>,
+    config: Config,
+}
+
+static CACHE: Mutex<Option<Cached>> = Mutex::new(None);
+
+/// Counts how many times `load()` actually hit the filesystem (read + parse).
+/// Used by the regression test to assert the cache is in fact short-circuiting
+/// repeat calls. Wrapping is fine — the test only checks deltas.
+#[cfg(test)]
+static READ_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn read_count() -> u64 {
+    READ_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Bust the cached parse — call after any write to `config.toml` so the next
+/// `load()` re-reads. Cheap (one lock + store-None), and mtime-based detection
+/// would catch most writes anyway, but a filesystem with 1-second mtime
+/// granularity could miss a same-second write/read pair.
+pub fn invalidate_cache() {
+    if let Ok(mut slot) = CACHE.lock() {
+        *slot = None;
+    }
+}
+
+/// Read + parse `~/.config/jfc/config.toml` from disk, no caching. Returns
+/// `Config::default()` on missing-file, permission-error, or parse-error,
+/// with a `warn!` on the last two (a missing file is the common case for
+/// fresh installs and stays at `trace!`). Pure I/O — safe to call from tests
+/// against arbitrary paths.
+fn load_from(path: &Path) -> Config {
+    #[cfg(test)]
+    READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let raw = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            tracing::debug!(target: "jfc::config", "config file not found — using defaults");
+            tracing::trace!(
+                target: "jfc::config",
+                path = %path.display(),
+                "config file not found — using defaults"
+            );
             return Config::default();
         }
         Err(e) => {
@@ -640,15 +689,7 @@ pub fn load() -> Config {
         }
     };
     match toml::from_str::<Config>(&raw) {
-        Ok(cfg) => {
-            tracing::debug!(
-                target: "jfc::config",
-                default_model = ?cfg.default.model,
-                agent_count = cfg.agents.len(),
-                "config loaded successfully"
-            );
-            cfg
-        }
+        Ok(cfg) => cfg,
         Err(e) => {
             tracing::warn!(
                 target: "jfc::config",
@@ -659,6 +700,50 @@ pub fn load() -> Config {
             Config::default()
         }
     }
+}
+
+/// Load `~/.config/jfc/config.toml`, returning `Config::default()` on any
+/// failure (missing file, permission error, parse error). Cached: subsequent
+/// calls with an unchanged file mtime return a clone of the previously-parsed
+/// `Config` instead of re-reading and re-parsing TOML.
+///
+/// Cache is invalidated automatically when the file mtime changes (covers
+/// editor saves, external `/theme` writes from another process). Code paths
+/// that write the file in-process should also call `invalidate_cache()` to
+/// handle the same-second-mtime corner case.
+///
+/// Hot path: this is called from the per-tick render loop (compact threshold
+/// check) at ~12 Hz, plus other render sites. Without the cache the program
+/// re-parses TOML ~50 times/second while idle.
+pub fn load() -> Config {
+    load_cached(&config_path())
+}
+
+/// Inner cache-and-load against an arbitrary path. Public-in-crate so the
+/// regression test can drive the cache against a tempdir without monkeypatching
+/// `dirs::config_dir()`. Production callers should use `load()` which routes
+/// through `config_path()`.
+pub(crate) fn load_cached(path: &Path) -> Config {
+    let cur_mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+
+    {
+        let slot = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = slot.as_ref()
+            && c.path == path
+            && c.mtime == cur_mtime
+        {
+            return c.config.clone();
+        }
+    }
+
+    let config = load_from(path);
+    let mut slot = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    *slot = Some(Cached {
+        path: path.to_path_buf(),
+        mtime: cur_mtime,
+        config: config.clone(),
+    });
+    config
 }
 
 /// Persist a chosen theme name to `~/.config/jfc/config.toml`,
@@ -713,8 +798,16 @@ pub fn save_theme_to(
     };
     cfg.theme = Some(theme_name.to_string());
     let serialized = toml::to_string_pretty(&cfg).map_err(|e| format!("serialize failed: {e}"))?;
-    std::fs::write(path, serialized)
+    // Atomic write — save_theme reads the existing config, mutates one
+    // field, and rewrites the whole TOML. A torn write would corrupt
+    // the user's entire config, not just the theme. The
+    // refuse-to-overwrite-unparseable check above only catches the
+    // pre-write state; the write itself must also be crash-safe.
+    crate::atomic_write::write_atomic_sync(path, serialized.as_bytes())
         .map_err(|e| format!("write {} failed: {e}", path.display()))?;
+    // We just rewrote the file in-process; bust the parse cache so the next
+    // load() reflects the new theme even if the mtime lands in the same second.
+    invalidate_cache();
     tracing::info!(
         target: "jfc::config",
         path = %path.display(),
@@ -727,6 +820,7 @@ pub fn save_theme_to(
 /// Resolve a prompt value that may be a `file://` URI.
 /// If it starts with `file://`, read the file contents.
 /// Otherwise return the string as-is.
+#[allow(dead_code)]
 pub fn resolve_prompt(value: &str, base_dir: Option<&std::path::Path>) -> String {
     if let Some(path_str) = value.strip_prefix("file://") {
         let path = if let Some(base) = base_dir {
@@ -751,6 +845,57 @@ pub fn resolve_prompt(value: &str, base_dir: Option<&std::path::Path>) -> String
     }
 }
 
+/// Persist the permission mode to config.toml so it survives sessions.
+/// Mirrors Claude Code v144's behavior where `/mode` changes the default.
+pub fn save_permission_mode(mode: &crate::app::PermissionMode) {
+    let mode_str = match mode {
+        crate::app::PermissionMode::Default => "default",
+        crate::app::PermissionMode::AcceptEdits => "accept-edits",
+        crate::app::PermissionMode::Plan => "plan",
+        crate::app::PermissionMode::BypassPermissions => "bypass",
+        crate::app::PermissionMode::Auto => "auto",
+    };
+    save_permission_mode_to(&config_path(), mode_str);
+}
+
+fn save_permission_mode_to(path: &std::path::Path, mode: &str) {
+    // Use the same read→patch→write pattern as save_theme: load the full
+    // Config, patch the field, re-serialize. This avoids needing toml_edit.
+    let mut cfg: Config = match std::fs::read_to_string(path) {
+        Ok(s) if !s.trim().is_empty() => match toml::from_str(&s) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    target: "jfc::config",
+                    path = %path.display(),
+                    error = %e,
+                    "save_permission_mode: cannot parse config — skipping persist"
+                );
+                return;
+            }
+        },
+        _ => Config::default(),
+    };
+    // Store in `[default.permission]` table — the `mode` key. The Config
+    // struct has `default.permission: HashMap<String, String>`.
+    cfg.default
+        .permission
+        .insert("mode".to_owned(), mode.to_owned());
+    if let Ok(serialized) = toml::to_string_pretty(&cfg) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        crate::atomic_write::write_atomic_sync(path, serialized.as_bytes()).ok();
+        invalidate_cache();
+        tracing::info!(
+            target: "jfc::config",
+            mode,
+            path = %path.display(),
+            "permission mode persisted to config.toml"
+        );
+    }
+}
+
 /// Resolve which model id should be used for a given agent, with a four-step
 /// cascade:
 ///
@@ -763,6 +908,7 @@ pub fn resolve_prompt(value: &str, base_dir: Option<&std::path::Path>) -> String
 /// `agent_name = None` skips steps 1 & 2 and goes straight to default. This is
 /// the path the primary chat agent takes since it has no per-agent override
 /// section.
+#[allow(dead_code)]
 pub fn resolve_model(cfg: &Config, agent_name: Option<&str>) -> Option<String> {
     let result = if let Some(name) = agent_name {
         if let Some(agent) = cfg.agents.get(name) {
@@ -791,6 +937,7 @@ pub fn resolve_model(cfg: &Config, agent_name: Option<&str>) -> Option<String> {
 /// Tools the named agent should NOT have access to. Returns `&[]` when the
 /// agent isn't in the config at all (so callers can union this with
 /// compiled-in defaults without an extra `None` branch).
+#[allow(dead_code)]
 pub fn agent_disallowed<'a>(cfg: &'a Config, agent_name: &str) -> &'a [String] {
     cfg.agents
         .get(agent_name)
@@ -1626,5 +1773,108 @@ model = "garbage"
         let cfg = Config::default();
         assert!(cfg.agents.is_empty());
         assert!(cfg.default.model.is_none());
+    }
+
+    // ─── parse cache (perf regression guard) ─────────────────────────────
+    //
+    // `load()` is called from the per-tick render loop. Before the cache it
+    // re-read + re-parsed config.toml ~50×/sec while idle, burning ~12% CPU on
+    // the main thread (profiled via strace: 50 openat("config.toml")/sec). The
+    // cache must short-circuit repeat calls with an unchanged mtime to one
+    // filesystem read. These tests touch process-global state (CACHE +
+    // READ_COUNT) so they're serialized.
+
+    #[test]
+    #[serial_test::serial]
+    fn load_cached_reads_file_once_for_repeated_calls_normal() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[default]\nmodel = \"anthropic/claude-opus-4-7\"\n").unwrap();
+
+        invalidate_cache();
+        let before = read_count();
+
+        let first = load_cached(&path);
+        let second = load_cached(&path);
+        let third = load_cached(&path);
+
+        // All three observe the same parsed value …
+        assert_eq!(first.default.model.as_deref(), Some("anthropic/claude-opus-4-7"));
+        assert_eq!(first, second);
+        assert_eq!(second, third);
+
+        // … but the file was read+parsed exactly once.
+        assert_eq!(
+            read_count() - before,
+            1,
+            "cache must collapse 3 load_cached calls into 1 filesystem read"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_cached_reparses_when_mtime_changes_robust() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[default]\nmodel = \"a/one\"\n").unwrap();
+
+        invalidate_cache();
+        let before = read_count();
+
+        let first = load_cached(&path);
+        assert_eq!(first.default.model.as_deref(), Some("a/one"));
+        assert_eq!(read_count() - before, 1);
+
+        // Rewrite with a bumped mtime. Filesystem mtime granularity can be as
+        // coarse as 1s, so set it explicitly into the future via
+        // std::fs::FileTimes to guarantee the cache sees a change without a
+        // real sleep.
+        std::fs::write(&path, "[default]\nmodel = \"b/two\"\n").unwrap();
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("reopen for set_times");
+        let times = std::fs::FileTimes::new().set_modified(future);
+        f.set_times(times).expect("bump mtime");
+        drop(f);
+
+        let second = load_cached(&path);
+        assert_eq!(
+            second.default.model.as_deref(),
+            Some("b/two"),
+            "changed mtime must trigger a re-read"
+        );
+        assert_eq!(
+            read_count() - before,
+            2,
+            "mtime change must cause exactly one additional read"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn invalidate_cache_forces_reread_robust() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[default]\nmodel = \"a/one\"\n").unwrap();
+
+        invalidate_cache();
+        let before = read_count();
+
+        let first = load_cached(&path);
+        assert_eq!(first.default.model.as_deref(), Some("a/one"));
+        assert_eq!(read_count() - before, 1);
+
+        // Explicit invalidation (mirrors save_theme/save_permission_mode) must
+        // force the next call back to disk even though the mtime is unchanged.
+        invalidate_cache();
+        let second = load_cached(&path);
+        assert_eq!(second.default.model.as_deref(), Some("a/one"));
+        assert_eq!(
+            read_count() - before,
+            2,
+            "invalidate_cache must force the next load back to the filesystem"
+        );
     }
 }

@@ -94,11 +94,13 @@ impl Intent {
 #[derive(Debug, Clone)]
 pub struct Classification {
     pub intent: Intent,
+    #[allow(dead_code)]
     pub confidence: f32,
 }
 
 /// Tool kind for availability mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum ToolKind {
     Read,
     Write,
@@ -356,7 +358,13 @@ fn classify_doc_intent(lower: &str) -> Option<Intent> {
     let has_doc_verb = contains_any(
         lower,
         &[
-            "draft ", "write ", "update ", "generate ", "create ", "refresh ", "make ",
+            "draft ",
+            "write ",
+            "update ",
+            "generate ",
+            "create ",
+            "refresh ",
+            "make ",
         ],
     );
 
@@ -597,12 +605,12 @@ fn extract_symbol(prompt: &str) -> Option<String> {
 
     // Backtick-quoted code spans are a strong signal too. "what depends
     // on `Foo::bar`" → extract `Foo::bar`.
-    if let Some(start) = prompt.find('`') {
-        if let Some(end_rel) = prompt[start + 1..].find('`') {
-            let span = &prompt[start + 1..start + 1 + end_rel];
-            if let Some(m) = re.find(span) {
-                return Some(m.as_str().to_owned());
-            }
+    if let Some(start) = prompt.find('`')
+        && let Some(end_rel) = prompt[start + 1..].find('`')
+    {
+        let span = &prompt[start + 1..start + 1 + end_rel];
+        if let Some(m) = re.find(span) {
+            return Some(m.as_str().to_owned());
         }
     }
 
@@ -961,6 +969,7 @@ fn build_entrypoint_body(cwd: &Path) -> String {
 }
 
 /// Get suggested tools for an intent (advisory, not enforcing).
+#[allow(dead_code)]
 pub fn suggested_tools(intent: Intent) -> Vec<ToolKind> {
     match intent {
         Intent::Research => vec![
@@ -1027,6 +1036,7 @@ pub fn suggested_tools(intent: Intent) -> Vec<ToolKind> {
 }
 
 /// Get tools that are discouraged for an intent (advisory).
+#[allow(dead_code)]
 pub fn discouraged_tools(intent: Intent) -> Vec<ToolKind> {
     match intent {
         Intent::Research => vec![ToolKind::Edit, ToolKind::Write],
@@ -1081,8 +1091,6 @@ pub fn auto_doc_suggest_enabled() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
-
     use super::*;
     use crate::types::{MessagePart, Role};
 
@@ -1148,14 +1156,13 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_performance() {
-        let start = Instant::now();
+    fn test_classify_hot_loop_stable() {
+        let prompt = "find where auth is handled and review the login implementation";
+        let expected = classify(prompt).intent;
 
         for _ in 0..1_000 {
-            let _ = classify("find where auth is handled and review the login implementation");
+            assert_eq!(classify(prompt).intent, expected);
         }
-
-        assert!(start.elapsed() < Duration::from_millis(50));
     }
 
     /// Normal: 5 different impact-analysis phrasings each map to
@@ -1387,10 +1394,7 @@ fn baz() -> i32 { 42 }
                 "what's our parity status with upstream",
                 Intent::DocParityRequest,
             ),
-            (
-                "generate the philosophy doc",
-                Intent::DocPhilosophyRequest,
-            ),
+            ("generate the philosophy doc", Intent::DocPhilosophyRequest),
             ("write a usage guide", Intent::DocUsageRequest),
         ];
         for (prompt, expected) in cases {

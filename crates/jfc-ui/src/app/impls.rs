@@ -1,7 +1,7 @@
 use std::time::Instant;
 
-use crate::provider::ModelInfo;
-use crate::types::{ToolCall, ToolKind};
+use crate::types::{MessagePart, Role, ToolCall, ToolKind};
+use jfc_provider::ModelInfo;
 
 use super::{App, PermissionDecision, STREAM_WATCHDOG_TIMEOUT_SECS};
 
@@ -39,14 +39,66 @@ impl App {
             .map(|t| t.elapsed().as_secs() >= STREAM_WATCHDOG_TIMEOUT_SECS)
             .unwrap_or(false);
         if timed_out {
+            let streaming_assistant_idx = self.streaming_assistant_idx;
             tracing::warn!(
                 target: "jfc::app",
                 elapsed_secs = self.last_stream_event_at.map(|t| t.elapsed().as_secs()).unwrap_or(0),
-                "stream watchdog: resetting stuck is_streaming flag"
+                "stream watchdog: cancelling hard-idle stream"
             );
+            // Cancel the stream task so it actually stops sending events.
+            // Without this the stream task continues running in the
+            // background, can still modify messages, and can dispatch
+            // tools into a stale context — the "half-dead state" bug.
+            self.cancel_token.cancel();
+            // Belt-and-suspenders: forcefully abort the spawned driver
+            // task too. The cooperative cancel above only stops the
+            // task if it polls `cancel_token`. A task wedged inside a
+            // blocking syscall (sync DNS lookup, sync audit-log write)
+            // never reaches a `.cancelled()` check, so the next user
+            // submission would race a second concurrent stream task
+            // writing the same conversation buffer — interleaved
+            // assistant prose. `JoinHandle::abort` schedules a forced
+            // unwind at the next await point.
+            if let Some(handle) = self.active_stream_handle.take() {
+                handle.abort();
+            }
+            // CRITICAL: replace the token after cancelling so the NEXT
+            // user submission gets a fresh, uncancelled token. Without
+            // this, every subsequent stream would immediately see
+            // `is_cancelled() == true` and emit "Interrupted by user"
+            // — that was the spurious-interrupt bug. The previous user
+            // submission's cancel flowed forward forever because the
+            // token is a single shared instance, not per-turn.
+            self.cancel_token = tokio_util::sync::CancellationToken::new();
             self.is_streaming = false;
             self.streaming_started_at = None;
             self.last_stream_event_at = None;
+            self.streaming_last_token_at = None;
+            self.thinking_started_at = None;
+            self.thinking_ended_at = None;
+            self.streaming_text.clear();
+            self.streaming_reasoning.clear();
+            self.streaming_response_bytes = 0;
+            self.streaming_assistant_idx = None;
+            self.current_stream_request = None;
+            self.turn_started_at = None;
+            // Clear any pending tool calls that accumulated during the
+            // dead stream — they're stale and would dispatch into wrong
+            // context if processed later.
+            self.pending_tool_calls.clear();
+            self.pre_dispatched_tool_ids.clear();
+            if let Some(idx) = streaming_assistant_idx
+                && idx < self.messages.len()
+            {
+                let msg = &self.messages[idx];
+                let empty_stream_placeholder = msg.role == Role::Assistant
+                    && msg.parts.iter().all(
+                        |part| matches!(part, MessagePart::Text(text) if text.trim().is_empty()),
+                    );
+                if empty_stream_placeholder {
+                    self.messages.remove(idx);
+                }
+            }
         }
     }
 
@@ -69,6 +121,7 @@ impl App {
     }
 
     /// Invalidate the cached git root so it will be re-resolved on next access.
+    #[allow(dead_code)]
     pub fn invalidate_git_root(&mut self) {
         self.git_root = None;
     }
@@ -82,7 +135,7 @@ impl App {
     /// existing one (the session-load path through the sidebar / `/continue`).
     pub fn switch_session(&mut self, id: Option<crate::ids::SessionId>) {
         let old_id = self.current_session_id.clone();
-        let new_id = id.unwrap_or_else(crate::session::generate_session_id);
+        let new_id = id.unwrap_or_else(jfc_session::generate_session_id);
         tracing::info!(
             target: "jfc::app",
             old_session_id = ?old_id,
@@ -90,11 +143,12 @@ impl App {
             "switch_session"
         );
         self.current_session_id = Some(new_id.clone());
-        self.task_store = crate::tasks::TaskStore::open(new_id.as_str());
+        self.task_store = jfc_session::TaskStore::open(new_id.as_str());
         self.task_completion_times.clear();
         self.task_activities.clear();
         self.task_panel_selected = 0;
         self.task_panel_state = ratatui::widgets::TableState::default().with_selected(Some(0));
+        self.task_panel_detail = false;
         self.viewing_task_id = None;
         self.viewing_task_expanded.clear();
         self.compact_suppressed = false;
@@ -206,6 +260,7 @@ impl App {
         self.scroll_down(half);
     }
 
+    #[allow(dead_code)]
     pub fn is_at_bottom(&self) -> bool {
         self.scroll_offset >= self.max_scroll()
     }
@@ -354,11 +409,21 @@ impl App {
         result
     }
 
+    /// Cancel a running background task by ID. Marks it as cancelled
+    /// and signals the underlying cancellation token if available.
+    #[allow(dead_code)]
+    pub fn cancel_background_task(&mut self, task_id: &str) {
+        use crate::types::TaskLifecycle;
+        if let Some(bt) = self.background_tasks.get_mut(task_id) {
+            bt.status = TaskLifecycle::Cancelled;
+        }
+    }
+
     /// Scan the task store for newly-completed tasks and record their
     /// completion instant so the footer can fade them out after 30 s.
     pub fn sync_task_completions(&mut self) {
-        use crate::tasks::TaskStatus;
-        for task in self.task_store.list(crate::tasks::DeletedFilter::Exclude) {
+        use jfc_session::TaskStatus;
+        for task in self.task_store.list(jfc_session::DeletedFilter::Exclude) {
             if task.status == TaskStatus::Completed
                 && !self.task_completion_times.contains_key(&task.id)
             {
@@ -371,7 +436,7 @@ impl App {
         self.task_completion_times.retain(|id, _| {
             store
                 .get(id)
-                .map_or(false, |t| t.status == TaskStatus::Completed)
+                .is_some_and(|t| t.status == TaskStatus::Completed)
         });
     }
 }

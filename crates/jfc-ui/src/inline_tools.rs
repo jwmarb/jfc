@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Parser for inline `<tool_call>` / `<tool_result>` XML-ish tags that some
 //! backends (notably OpenWebUI's tool-running shim and some
 //! Anthropic-on-third-party gateways) stream interleaved with assistant text.
@@ -166,7 +165,7 @@ fn summarize_args(args: Option<&Value>) -> String {
 /// Returns `true` if `text` contains any inline tool tag — a quick test the
 /// renderer uses to decide whether to invoke the parser at all.
 pub fn contains_inline_tools(text: &str) -> bool {
-    text.contains(OPEN_CALL) || text.contains(OPEN_RESULT)
+    text.contains(OPEN_CALL) || text.contains(OPEN_RESULT) || text.contains("<tool_use>")
 }
 
 #[cfg(test)]

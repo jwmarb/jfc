@@ -218,11 +218,7 @@ impl NodeData {
 
 /// Inclusive range query against a numeric index built via
 /// [`numeric_index`].
-pub fn numeric_index_range<'a>(
-    idx: &'a BTreeMap<u64, Vec<NodeId>>,
-    lo: u64,
-    hi: u64,
-) -> Vec<&'a NodeId> {
+pub fn numeric_index_range(idx: &BTreeMap<u64, Vec<NodeId>>, lo: u64, hi: u64) -> Vec<&NodeId> {
     let mut out = Vec::new();
     for (_, ids) in idx.range(lo..=hi) {
         for id in ids {
@@ -511,7 +507,7 @@ mod tests {
         let target = g.add_node(mk("g", NodeKind::Function, &[]));
 
         let typed: TypedEdge<marker::Function, marker::Function, marker::CallsKind> =
-            TypedEdge::new(f.clone(), target.clone());
+            TypedEdge::new(f, target);
         let (a, b, k) = typed.into_inner();
         g.add_edge(
             &a,

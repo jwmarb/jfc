@@ -2,16 +2,17 @@ use super::assistant_parts::{sanitize_terminal_text, truncate_str};
 use super::bash::{BashCmdKind, classify_bash_cmd};
 use super::core::diagnostics_for_path;
 use super::detection::looks_like_git_diff_output;
+use super::formatters::{
+    produce_cat_markdown_output_lines, produce_cat_output_lines, produce_command_output_lines,
+    produce_compiler_output_lines, produce_file_list_lines, produce_git_diff_output_lines,
+    produce_git_log_output_lines, produce_grep_output_lines, produce_hex_dump_output_lines,
+    produce_path_list_output_lines, produce_tabular_list_output_lines,
+};
 use super::output_style::{
     colorize_diagnostic_prefix, colorize_git_commit_line, colorize_git_diff_line,
     colorize_git_log_line, colorize_git_push_line, colorize_git_status_line,
 };
-use super::outputs::{
-    produce_cat_markdown_output_lines, produce_cat_output_lines, produce_command_output_lines,
-    produce_compiler_output_lines, produce_file_list_lines, produce_git_diff_output_lines,
-    produce_git_log_output_lines, produce_grep_output_lines, produce_hex_dump_output_lines,
-    produce_path_list_output_lines, produce_tabular_list_output_lines, render_diff_skip,
-};
+use super::outputs::render_diff_skip;
 use super::syntax::{
     infer_lang_from_bash, infer_lang_from_tool, looks_like_markdown,
     produce_highlighted_block_lines, produce_highlighted_with_line_numbers_lines,
@@ -274,6 +275,20 @@ pub(super) fn tool_body_lines_themed(
             )
         }
         ToolOutput::FileList(files) => produce_file_list_lines(files, t),
+        ToolOutput::ServerToolResult { tool_kind, content } => {
+            // Render the parsed JSON via the same text helper used for
+            // ToolOutput::Text — the resulting string is already
+            // human-readable (titled bulleted list for web_search,
+            // pretty-printed JSON for the others).
+            let rendered = crate::types::format_server_tool_result_text_public(tool_kind, content);
+            produce_text_block_lines(
+                &rendered,
+                content_w,
+                t.text_secondary,
+                t,
+                tool.display.is_expanded(),
+            )
+        }
     }
 }
 
@@ -338,19 +353,17 @@ pub(super) fn render_tool_block(
     if skip == 0
         && matches!(tool.status, crate::types::ToolStatus::Completed)
         && !crate::spinner::reduced_motion()
+        && let Some((id, when)) = &app.recent_tool_completion
+        && id == &tool.id
     {
-        if let Some((id, when)) = &app.recent_tool_completion {
-            if id == &tool.id {
-                let age = when.elapsed();
-                if age < std::time::Duration::from_millis(600) {
-                    let intensity = 1.0 - (age.as_millis() as f32 / 600.0);
-                    if area.x < buf.area().right() {
-                        let cell = &mut buf[(area.x, area.y)];
-                        cell.set_symbol("✦");
-                        let blended = crate::render::pulse_color_pub(t.bg, t.accent, intensity);
-                        cell.set_style(Style::default().fg(blended));
-                    }
-                }
+        let age = when.elapsed();
+        if age < std::time::Duration::from_millis(600) {
+            let intensity = 1.0 - (age.as_millis() as f32 / 600.0);
+            if area.x < buf.area().right() {
+                let cell = &mut buf[(area.x, area.y)];
+                cell.set_symbol("✦");
+                let blended = crate::render::pulse_color_pub(t.bg, t.accent, intensity);
+                cell.set_style(Style::default().fg(blended));
             }
         }
     }
@@ -608,6 +621,7 @@ pub fn tool_kind_color(kind: &ToolKind, t: &Theme) -> ratatui::style::Color {
         | ToolKind::TaskUpdate
         | ToolKind::TaskList
         | ToolKind::TaskDone
+        | ToolKind::TaskStop
         | ToolKind::TaskGet
         | ToolKind::TaskValidate => Color::Rgb(140, 220, 220), // teal
         ToolKind::MemoryCreate | ToolKind::MemoryDelete => Color::Rgb(220, 220, 140), // olive
@@ -617,9 +631,10 @@ pub fn tool_kind_color(kind: &ToolKind, t: &Theme) -> ratatui::style::Color {
         | ToolKind::TeamMemberMode => Color::Rgb(255, 150, 130), // coral
         ToolKind::Skill => Color::Rgb(180, 220, 255), // ice
         ToolKind::ToolSearch | ToolKind::ToolSuggest => Color::Rgb(170, 210, 180),
-        ToolKind::GraphQuery | ToolKind::SymbolEdit | ToolKind::RunCoverage => {
-            Color::Rgb(130, 200, 180)
-        } // sage
+        ToolKind::CodeIndex
+        | ToolKind::GraphQuery
+        | ToolKind::SymbolEdit
+        | ToolKind::RunCoverage => Color::Rgb(130, 200, 180), // sage
         ToolKind::PostBounty | ToolKind::RunBounty | ToolKind::MarketStatus => {
             Color::Rgb(255, 215, 100)
         } // gold
@@ -694,7 +709,7 @@ pub fn tool_status_icon_animated(
             // periodicities take ~25 ticks (2s) to align — beyond
             // perceptual gestalt.
             let glyph = RUNNING_FRAMES[(frame / 4) % RUNNING_FRAMES.len()];
-            let bright = (frame / 9) % 2 == 0;
+            let bright = (frame / 9).is_multiple_of(2);
             let style = if bright {
                 Style::default()
                     .fg(t.accent)
@@ -712,6 +727,7 @@ pub fn tool_status_icon_animated(
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn border_color_for_status(tool: &ToolCall, t: &Theme) -> Color {
     // Idle is Task-only territory but still valid on the unified
     // ExecutionStatus enum — render with the same accent as Running

@@ -29,11 +29,11 @@ use anyhow::{Result, anyhow};
 use futures::StreamExt;
 use uuid::Uuid;
 
-use crate::provider::{
+use crate::types::{ChatMessage, MessagePart, Role};
+use jfc_provider::{
     CompletionResponse, ModelId, Provider, ProviderContent, ProviderMessage, ProviderRole,
     StreamEvent, StreamOptions,
 };
-use crate::types::{ChatMessage, MessagePart, Role};
 
 /// Default per-session token budget. Conservative — about three round-trips
 /// worth of advisor calls on a 200K-context model. Users can override via
@@ -79,6 +79,7 @@ impl AdvisorSession {
     }
 
     /// Builder-style budget override.
+    #[allow(dead_code)]
     pub fn with_budget(mut self, budget: u64) -> Self {
         self.token_budget = budget;
         self
@@ -299,7 +300,7 @@ async fn stream_to_completion(
 ) -> Result<CompletionResponse> {
     let mut stream = provider.stream(messages, opts).await?;
     let mut collected = String::new();
-    let mut usage = crate::provider::TokenUsage::default();
+    let mut usage = jfc_provider::TokenUsage::default();
     while let Some(event) = stream.next().await {
         match event {
             Ok(StreamEvent::TextDelta { delta, .. }) => collected.push_str(&delta),
@@ -329,10 +330,10 @@ async fn stream_to_completion(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{
+    use async_trait::async_trait;
+    use jfc_provider::{
         EventStream, ModelInfo, ProviderMessage as PMsg, StreamConvention, StreamOptions as SOpts,
     };
-    use async_trait::async_trait;
 
     /// Mock provider that always returns a canned `CompletionResponse`.
     /// Modelled on `auto_mode::tests::FakeProvider` — same Mutex-of-Option
@@ -346,7 +347,7 @@ mod tests {
             Self {
                 result: std::sync::Mutex::new(Some(Ok(CompletionResponse {
                     content: reply.to_owned(),
-                    usage: crate::provider::TokenUsage {
+                    usage: jfc_provider::TokenUsage {
                         input_tokens: 100,
                         output_tokens: 50,
                         cache_read_tokens: 0,
@@ -379,8 +380,8 @@ mod tests {
         }
         async fn complete(
             &self,
-            _messages: Vec<PMsg>,
-            _options: &SOpts,
+            #[allow(dead_code)] messages: Vec<PMsg>,
+            #[allow(dead_code)] options: &SOpts,
         ) -> Result<CompletionResponse> {
             self.result
                 .lock()
@@ -389,7 +390,7 @@ mod tests {
                 .expect("FakeProvider::complete called more than once")
         }
     }
-    impl crate::provider::seal::Sealed for FakeProvider {}
+    impl jfc_provider::seal::Sealed for FakeProvider {}
 
     // ─── Normal path ─────────────────────────────────────────────────────
 
@@ -629,7 +630,7 @@ mod tests {
                 })
             }
         }
-        impl crate::provider::seal::Sealed for ZeroUsageProvider {}
+        impl jfc_provider::seal::Sealed for ZeroUsageProvider {}
         let mut session = AdvisorSession::new("test-model").with_budget(10_000);
         let _ = ask_advisor(&ZeroUsageProvider, &mut session, "hi".into(), &[])
             .await

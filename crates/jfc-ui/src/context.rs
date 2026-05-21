@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -75,6 +73,11 @@ impl ReadDedupCache {
         tracing::debug!(target: "jfc::context", entries = self.entries.len(), "clearing read cache");
         self.entries.clear();
     }
+
+    /// Return all cached file paths (unordered).
+    pub fn paths(&self) -> Vec<std::path::PathBuf> {
+        self.entries.keys().cloned().collect()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -98,21 +101,22 @@ impl ToolContext {
 
 /// Walk from `start` upward to filesystem root looking for CLAUDE.md.
 /// Returns (path, content) of the first one found, or None.
+#[allow(dead_code)]
 pub fn find_claude_md(start: &Path) -> Option<(PathBuf, String)> {
     tracing::debug!(target: "jfc::context", start = %start.display(), "searching for CLAUDE.md");
     let mut dir = start.to_path_buf();
     loop {
         let candidate = dir.join("CLAUDE.md");
-        if let Ok(content) = std::fs::read_to_string(&candidate) {
-            if !content.trim().is_empty() {
-                tracing::info!(
-                    target: "jfc::context",
-                    path = %candidate.display(),
-                    size_bytes = content.len(),
-                    "found CLAUDE.md"
-                );
-                return Some((candidate, content));
-            }
+        if let Ok(content) = std::fs::read_to_string(&candidate)
+            && !content.trim().is_empty()
+        {
+            tracing::info!(
+                target: "jfc::context",
+                path = %candidate.display(),
+                size_bytes = content.len(),
+                "found CLAUDE.md"
+            );
+            return Some((candidate, content));
         }
         match dir.parent() {
             Some(parent) if parent != dir => dir = parent.to_path_buf(),
@@ -171,17 +175,17 @@ impl ClaudeMdHierarchy {
     pub fn render(&self) -> Option<String> {
         let mut out = String::new();
         let mut push = |label: &str, layer: &Option<(PathBuf, String)>| {
-            if let Some((path, content)) = layer {
-                if !content.trim().is_empty() {
-                    if !out.is_empty() {
-                        out.push_str("\n\n");
-                    }
-                    out.push_str(&format!(
-                        "# {label} ({})\n\n{}",
-                        path.display(),
-                        content.trim()
-                    ));
+            if let Some((path, content)) = layer
+                && !content.trim().is_empty()
+            {
+                if !out.is_empty() {
+                    out.push_str("\n\n");
                 }
+                out.push_str(&format!(
+                    "# {label} ({})\n\n{}",
+                    path.display(),
+                    content.trim()
+                ));
             }
         };
         push("Managed policy", &self.managed);
@@ -216,6 +220,7 @@ fn read_if_exists(path: &Path) -> Option<(PathBuf, String)> {
     Some((path.to_path_buf(), content))
 }
 
+#[allow(dead_code)]
 pub fn build_system_prompt(claude_md: Option<&str>) -> Option<String> {
     let has_claude_md = claude_md.is_some();
     let base = claude_md?.trim();
@@ -460,5 +465,20 @@ mod tests {
         assert!(build_system_prompt(None).is_none());
         assert!(build_system_prompt(Some("")).is_none());
         assert!(build_system_prompt(Some("    ")).is_none());
+    }
+}
+
+/// Walk up from CWD to find the nearest `.git` directory and return its parent.
+/// Used at startup to anchor the project-level task store before the app's
+/// lazy-resolved `git_root` is available.
+pub fn discover_git_root() -> Option<PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        if dir.join(".git").exists() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
     }
 }

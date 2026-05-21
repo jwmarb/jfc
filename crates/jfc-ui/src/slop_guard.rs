@@ -12,8 +12,6 @@
 //! 5. Complexity budget (LOC + nesting depth per function)
 //! 6. Test quality (implementation-coupling heuristics)
 
-#![allow(dead_code)]
-
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
@@ -47,11 +45,7 @@ fn hash_window(lines: &[&str]) -> u64 {
 
 /// Find 5+ line blocks in `new_content` that already exist in other files
 /// under `cwd`. Returns (existing_file, existing_line, matched_text_preview).
-pub fn check_duplication(
-    new_content: &str,
-    file_path: &Path,
-    cwd: &Path,
-) -> Vec<SlopFinding> {
+pub fn check_duplication(new_content: &str, file_path: &Path, cwd: &Path) -> Vec<SlopFinding> {
     let new_lines: Vec<&str> = new_content.lines().collect();
     if new_lines.len() < DUP_WINDOW {
         return Vec::new();
@@ -88,12 +82,14 @@ pub fn check_duplication(
             continue;
         }
         // Skip self.
-        if let Some(ref cn) = canonical_new {
-            if path.canonicalize().ok().as_ref() == Some(cn) {
-                continue;
-            }
+        if let Some(ref cn) = canonical_new
+            && path.canonicalize().ok().as_ref() == Some(cn)
+        {
+            continue;
         }
-        let Ok(content) = std::fs::read_to_string(path) else { continue };
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
         let lines: Vec<&str> = content.lines().collect();
         if lines.len() < DUP_WINDOW {
             continue;
@@ -106,13 +102,28 @@ pub fn check_duplication(
             let h = hash_window(window);
             if new_hashes.contains(&h) {
                 let preview = window[0..2].join(" / ");
+                // Slice on a char boundary — `preview` is arbitrary
+                // source code (file paths in module separators, em-dashes
+                // in comments, …) and a fixed-byte cap blew up at runtime
+                // when a multi-byte glyph straddled byte 80
+                // (`thread 'tokio-rt-worker' panicked at slop_guard.rs:114:
+                //  end byte index 80 is not a char boundary; it is inside
+                //  '─' (bytes 79..82)`). `floor_char_boundary` rounds DOWN
+                // to the nearest char boundary at or before the requested
+                // index, so we get at most 80 bytes of preview without
+                // ever splitting a UTF-8 sequence.
+                let preview_slice: &str = if preview.len() > 80 {
+                    &preview[..preview.floor_char_boundary(80)]
+                } else {
+                    &preview
+                };
                 findings.push(SlopFinding {
                     rule: "duplication".into(),
                     message: format!(
                         "5+ line block already exists at {}:{} — consider reusing: `{}`",
                         path.strip_prefix(cwd).unwrap_or(path).display(),
                         i + 1,
-                        if preview.len() > 80 { &preview[..80] } else { &preview }
+                        preview_slice
                     ),
                     file: Some(path.strip_prefix(cwd).unwrap_or(path).display().to_string()),
                     line: Some(i + 1),
@@ -135,22 +146,29 @@ pub fn check_duplication(
 
 /// Run `cargo check --message-format=json` and extract dead_code warnings.
 /// Returns quickly — uses cached incremental compilation.
+#[allow(dead_code)]
 pub fn check_dead_code(cwd: &Path) -> Vec<SlopFinding> {
     let output = std::process::Command::new("cargo")
         .args(["check", "--message-format=json", "-q"])
         .current_dir(cwd)
         .output();
 
-    let Ok(output) = output else { return Vec::new() };
+    let Ok(output) = output else {
+        return Vec::new();
+    };
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     let mut findings = Vec::new();
     for line in stdout.lines() {
-        let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
         if msg.get("reason").and_then(|v| v.as_str()) != Some("compiler-message") {
             continue;
         }
-        let Some(message) = msg.get("message") else { continue };
+        let Some(message) = msg.get("message") else {
+            continue;
+        };
         let code = message
             .get("code")
             .and_then(|c| c.get("code"))
@@ -159,7 +177,10 @@ pub fn check_dead_code(cwd: &Path) -> Vec<SlopFinding> {
         if code != "dead_code" {
             continue;
         }
-        let text = message.get("message").and_then(|m| m.as_str()).unwrap_or("");
+        let text = message
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
         let span = message
             .get("spans")
             .and_then(|s| s.as_array())
@@ -193,7 +214,10 @@ pub fn check_dead_code(cwd: &Path) -> Vec<SlopFinding> {
 pub fn check_coherence(file_content: &str, file_path: &Path) -> Vec<SlopFinding> {
     let mut findings = Vec::new();
     let is_test = file_content.contains("#[cfg(test)]");
-    let is_lib = file_path.to_str().map(|s| !s.contains("/main.rs") && !s.contains("/bin/")).unwrap_or(true);
+    let is_lib = file_path
+        .to_str()
+        .map(|s| !s.contains("/main.rs") && !s.contains("/bin/"))
+        .unwrap_or(true);
 
     // Check: anyhow::Result in library code (should use typed errors).
     if is_lib && !is_test {
@@ -245,7 +269,10 @@ pub fn check_coherence(file_content: &str, file_path: &Path) -> Vec<SlopFinding>
         if (t.contains("todo!()") || t.contains("unimplemented!()")) && !t.starts_with("//") {
             findings.push(SlopFinding {
                 rule: "coherence".into(),
-                message: format!("Line {}: contains todo!()/unimplemented!() — should not be committed", i + 1),
+                message: format!(
+                    "Line {}: contains todo!()/unimplemented!() — should not be committed",
+                    i + 1
+                ),
                 file: None,
                 line: Some(i + 1),
             });
@@ -260,11 +287,18 @@ pub fn check_coherence(file_content: &str, file_path: &Path) -> Vec<SlopFinding>
 /// Check git log for files with high edit frequency in the last 7 days.
 pub fn check_churn(cwd: &Path) -> Vec<SlopFinding> {
     let output = std::process::Command::new("git")
-        .args(["log", "--since=7 days ago", "--name-only", "--pretty=format:"])
+        .args([
+            "log",
+            "--since=7 days ago",
+            "--name-only",
+            "--pretty=format:",
+        ])
         .current_dir(cwd)
         .output();
 
-    let Ok(output) = output else { return Vec::new() };
+    let Ok(output) = output else {
+        return Vec::new();
+    };
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     let mut counts: HashMap<&str, u32> = HashMap::new();
@@ -424,16 +458,21 @@ pub fn check_test_quality(file_content: &str) -> Vec<SlopFinding> {
             depth = 0;
             continue;
         }
-        if in_test_fn && depth == 0 {
-            if let Some(m) = fn_re.captures(line) {
-                fn_name = m.get(1).map(|m| m.as_str().to_owned()).unwrap_or_default();
-                fn_start = i + 1;
-            }
+        if in_test_fn
+            && depth == 0
+            && let Some(m) = fn_re.captures(line)
+        {
+            fn_name = m.get(1).map(|m| m.as_str().to_owned()).unwrap_or_default();
+            fn_start = i + 1;
         }
         if in_test_fn {
             for ch in line.chars() {
-                if ch == '{' { depth += 1; }
-                if ch == '}' { depth -= 1; }
+                if ch == '{' {
+                    depth += 1;
+                }
+                if ch == '}' {
+                    depth -= 1;
+                }
             }
             if line.contains("assert") || line.contains("panic!") || line.contains("should_panic") {
                 has_assert = true;
@@ -510,7 +549,10 @@ pub fn format_report(report: &SlopReport) -> String {
             (Some(f), None) => format!(" ({f})"),
             (None, None) => String::new(),
         };
-        out.push_str(&format!("  • [{}]{loc}: {}\n", finding.rule, finding.message));
+        out.push_str(&format!(
+            "  • [{}]{loc}: {}\n",
+            finding.rule, finding.message
+        ));
     }
     out
 }
@@ -522,13 +564,12 @@ mod tests {
 
     #[test]
     fn complexity_flags_long_function_normal() {
-        let code = format!(
-            "pub fn big_one() {{\n{}\n}}",
-            "    let x = 1;\n".repeat(90)
-        );
+        let code = format!("pub fn big_one() {{\n{}\n}}", "    let x = 1;\n".repeat(90));
         let findings = check_complexity(&code);
         assert!(
-            findings.iter().any(|f| f.rule == "complexity" && f.message.contains("lines")),
+            findings
+                .iter()
+                .any(|f| f.rule == "complexity" && f.message.contains("lines")),
             "expected complexity finding, got: {findings:?}",
         );
     }
@@ -589,7 +630,11 @@ mod tests {
     fn test_quality_ok_with_assert_normal() {
         let code = "#[cfg(test)]\nmod tests {\n    #[test]\n    fn works() {\n        assert_eq!(1, 1);\n    }\n}";
         let findings = check_test_quality(code);
-        assert!(findings.iter().all(|f| !f.message.contains("no assertions")));
+        assert!(
+            findings
+                .iter()
+                .all(|f| !f.message.contains("no assertions"))
+        );
     }
 
     #[test]
@@ -602,7 +647,10 @@ mod tests {
 
     #[test]
     fn format_report_empty_returns_empty_normal() {
-        let report = SlopReport { has_findings: false, findings: Vec::new() };
+        let report = SlopReport {
+            has_findings: false,
+            findings: Vec::new(),
+        };
         assert_eq!(format_report(&report), "");
     }
 

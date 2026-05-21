@@ -10,6 +10,14 @@ use super::lsp::execute_lsp;
 use super::memory::{execute_memory_create, execute_memory_delete};
 use super::notebook::{notebook_edit_text, notebook_read_text};
 use super::notifications::{execute_push_notification, execute_remote_trigger, parse_trigger_url};
+use super::registry::{
+    active_event_sender_handle, auto_context_queue, get_or_build_graph_session, graph_history,
+    graph_session_cache, market_orchestrator, record_graph_query, with_graph_session_mut,
+};
+use super::safe_tools::{
+    configure_tool_command, non_interactive_shell_command, terminal_safe_text,
+};
+use super::scratchpad::{execute_scratchpad_read, execute_scratchpad_write};
 use super::search::{execute_glob, execute_grep};
 use super::subagent::{execute_skill_in, filter_tools_for_agent};
 use super::swarm::execute_team_member_mode;
@@ -19,9 +27,10 @@ use super::tasks::{
 use super::worktree::{execute_enter_plan_mode, execute_enter_worktree, execute_exit_worktree};
 use super::*;
 
-use crate::provider::ToolDef;
-use crate::tasks::TaskStore;
+use crate::runtime::{DiagnosticLevel, ToolOutcome};
 use crate::types::{ReplacementMode, ToolInput, ToolKind};
+use jfc_provider::ToolDef;
+use jfc_session::{DeletedFilter, TaskStore};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use tokio::process::Command;
@@ -205,6 +214,7 @@ fn all_tool_defs_includes_every_canonical_tool_normal() {
         "TeamDelete",
         "SendMessage",
         "TeamMemberMode",
+        "code_index",
         "graph_query",
         "symbol_edit",
         "post_bounty",
@@ -228,16 +238,23 @@ fn all_tool_defs_includes_every_canonical_tool_normal() {
 
 // ─── graph_session_cache ─────────────────────────────────────────────
 
+fn graph_session_cache_test_workspace() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("graph session cache tempdir");
+    std::fs::write(
+        dir.path().join("sample.rs"),
+        "pub fn foo() { bar(); }\nfn bar() -> usize { 1 }\n",
+    )
+    .expect("write graph cache fixture");
+    dir
+}
+
 // Normal: repeated `get_or_build_graph_session` calls for the same cwd
 // return Arc clones (same pointer), so the graph is built once.
 #[serial_test::serial]
 #[test]
 fn graph_session_cache_reuses_same_session_normal() {
-    // The fixtures dir under jfc-graph is a stable target.
-    let fixtures = std::path::Path::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../jfc-graph/tests/fixtures"
-    ));
+    let workspace = graph_session_cache_test_workspace();
+    let fixtures = workspace.path();
     invalidate_graph_session_cache(Some(fixtures));
     let a = get_or_build_graph_session(fixtures);
     let b = get_or_build_graph_session(fixtures);
@@ -249,10 +266,8 @@ fn graph_session_cache_reuses_same_session_normal() {
 #[test]
 #[serial_test::serial]
 fn graph_session_cache_invalidate_drops_session_robust() {
-    let fixtures = std::path::Path::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../jfc-graph/tests/fixtures"
-    ));
+    let workspace = graph_session_cache_test_workspace();
+    let fixtures = workspace.path();
     invalidate_graph_session_cache(Some(fixtures));
     let a = get_or_build_graph_session(fixtures);
     invalidate_graph_session_cache(Some(fixtures));
@@ -260,14 +275,47 @@ fn graph_session_cache_invalidate_drops_session_robust() {
     assert!(!Arc::ptr_eq(&a, &b), "post-invalidate must build fresh");
 }
 
+#[test]
+#[serial_test::serial]
+fn graph_session_cache_mutation_reinserts_session_normal() {
+    let workspace = graph_session_cache_test_workspace();
+    let fixtures = workspace.path();
+    invalidate_graph_session_cache(Some(fixtures));
+
+    let node_count = with_graph_session_mut(fixtures, |session| session.graph.node_count())
+        .expect("exclusive cached session should be mutable");
+    let after = get_or_build_graph_session(fixtures);
+
+    assert_eq!(after.graph.node_count(), node_count);
+}
+
+#[test]
+#[serial_test::serial]
+fn graph_session_cache_mutation_fails_while_reader_holds_arc_robust() {
+    let workspace = graph_session_cache_test_workspace();
+    let fixtures = workspace.path();
+    invalidate_graph_session_cache(Some(fixtures));
+
+    let held = get_or_build_graph_session(fixtures);
+    let result = with_graph_session_mut(fixtures, |_| ());
+    let after = get_or_build_graph_session(fixtures);
+
+    assert!(
+        result.is_err(),
+        "shared session must not be mutably aliased"
+    );
+    assert!(
+        Arc::ptr_eq(&held, &after),
+        "failed mutation should reinsert the original session"
+    );
+}
+
 // Robust: `invalidate_graph_session_cache(None)` clears every entry,
 // not just one workspace.
 #[test]
 fn graph_session_cache_invalidate_all_clears_robust() {
-    let fixtures = std::path::Path::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../jfc-graph/tests/fixtures"
-    ));
+    let workspace = graph_session_cache_test_workspace();
+    let fixtures = workspace.path();
     let _ = get_or_build_graph_session(fixtures);
     invalidate_graph_session_cache(None);
     let after = graph_session_cache().lock().expect("cache lock").len();
@@ -489,9 +537,9 @@ fn cascade_summary_empty_for_leaf_robust() {
 /// Tests against the process-global market orchestrator must serialize
 /// through this lock — same pattern as graph_history. Otherwise the
 /// posted-bounty count test races with the report-format test.
-fn market_test_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+fn market_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 // Normal: the two market tools appear in the canonical-tool list
@@ -511,7 +559,7 @@ fn market_tools_in_catalogue_normal() {
 // breaks both the tool and the slash command.
 #[tokio::test]
 async fn market_report_string_has_expected_sections_normal() {
-    let _g = market_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _g = market_test_lock().lock().await;
     let body = market_report_string()
         .await
         .expect("market report must render");
@@ -527,7 +575,7 @@ async fn market_report_string_has_expected_sections_normal() {
 // orchestrator) is connected.
 #[tokio::test(flavor = "current_thread")]
 async fn post_bounty_dispatch_increments_market_normal() {
-    let _g = market_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _g = market_test_lock().lock().await;
     let before = {
         let orch = market_orchestrator().lock().await;
         orch.bounties.audit_log().len()
@@ -566,30 +614,30 @@ async fn post_bounty_dispatch_increments_market_normal() {
 // error — most common LLM mistake will be a typo'd ID.
 #[tokio::test(flavor = "current_thread")]
 async fn run_bounty_unknown_id_errors_robust() {
-    let _g = market_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _g = market_test_lock().lock().await;
     // Register a stub provider so the "no provider" path
     // doesn't fire first and mask the unknown-id check.
     struct NoopProvider;
     #[async_trait::async_trait]
-    impl crate::provider::Provider for NoopProvider {
+    impl jfc_provider::Provider for NoopProvider {
         fn name(&self) -> &str {
             "noop"
         }
-        fn available_models(&self) -> Vec<crate::provider::ModelInfo> {
+        fn available_models(&self) -> Vec<jfc_provider::ModelInfo> {
             vec![]
         }
         async fn stream(
             &self,
-            _: Vec<crate::provider::ProviderMessage>,
-            _: &crate::provider::StreamOptions,
-        ) -> anyhow::Result<crate::provider::EventStream> {
+            _: Vec<jfc_provider::ProviderMessage>,
+            _: &jfc_provider::StreamOptions,
+        ) -> anyhow::Result<jfc_provider::EventStream> {
             Err(anyhow::anyhow!("noop"))
         }
     }
-    impl crate::provider::seal::Sealed for NoopProvider {}
+    impl jfc_provider::seal::Sealed for NoopProvider {}
     register_active_provider(
         std::sync::Arc::new(NoopProvider),
-        crate::provider::ModelId::new("noop"),
+        jfc_provider::ModelId::new("noop"),
     );
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let res = execute_tool(
@@ -619,7 +667,7 @@ async fn run_bounty_unknown_id_errors_robust() {
 // implemented and bypass to direct Bash execution.
 #[tokio::test(flavor = "current_thread")]
 async fn post_bounty_default_returns_actionable_message_normal() {
-    let _g = market_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _g = market_test_lock().lock().await;
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let res = execute_tool(
         crate::types::ToolKind::PostBounty,
@@ -706,7 +754,7 @@ impl jfc_economy::reporting::AgentInvoker for StubInvoker {
     }
     async fn invoke_validator(
         &self,
-        _prompt: jfc_economy::reporting::ValidatorPrompt,
+        #[allow(dead_code)] prompt: jfc_economy::reporting::ValidatorPrompt,
     ) -> Result<jfc_economy::reporting::ValidatorOutcome, String> {
         *self.validator_calls.lock().unwrap() += 1;
         Ok(jfc_economy::reporting::ValidatorOutcome {
@@ -818,24 +866,24 @@ fn register_active_provider_round_trip_normal() {
     // reuse it.
     struct NoopProvider;
     #[async_trait::async_trait]
-    impl crate::provider::Provider for NoopProvider {
+    impl jfc_provider::Provider for NoopProvider {
         fn name(&self) -> &str {
             "noop"
         }
-        fn available_models(&self) -> Vec<crate::provider::ModelInfo> {
+        fn available_models(&self) -> Vec<jfc_provider::ModelInfo> {
             vec![]
         }
         async fn stream(
             &self,
-            _: Vec<crate::provider::ProviderMessage>,
-            _: &crate::provider::StreamOptions,
-        ) -> anyhow::Result<crate::provider::EventStream> {
+            _: Vec<jfc_provider::ProviderMessage>,
+            _: &jfc_provider::StreamOptions,
+        ) -> anyhow::Result<jfc_provider::EventStream> {
             Err(anyhow::anyhow!("noop"))
         }
     }
-    impl crate::provider::seal::Sealed for NoopProvider {}
-    let p: std::sync::Arc<dyn crate::provider::Provider> = std::sync::Arc::new(NoopProvider);
-    let m = crate::provider::ModelId::new("noop-model");
+    impl jfc_provider::seal::Sealed for NoopProvider {}
+    let p: std::sync::Arc<dyn jfc_provider::Provider> = std::sync::Arc::new(NoopProvider);
+    let m = jfc_provider::ModelId::new("noop-model");
     register_active_provider(p, m.clone());
     let snap = snapshot_active_provider().expect("provider should be registered");
     assert_eq!(snap.0.name(), "noop");
@@ -961,9 +1009,9 @@ fn clear_graph_history() {
 /// `clear_graph_history()` + `record_graph_query()` will trip each
 /// other's assertions (e.g. one test clears just after the other
 /// recorded its entry but before the assertion runs).
-fn graph_history_test_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+fn graph_history_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 // Normal: parse_file_blocks extracts a single FILE block.
@@ -1122,9 +1170,7 @@ async fn verify_bounty_solution_rejects_broken_zig_build_robust() {
 // the suite may have produced entries — just that ours appears.
 #[test]
 fn graph_history_records_query_normal() {
-    let _guard = graph_history_test_lock()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let _guard = graph_history_test_lock().blocking_lock();
     clear_graph_history();
     let fixtures = std::path::Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -1143,9 +1189,7 @@ fn graph_history_records_query_normal() {
 // Push 60 distinct queries; only the most recent 50 survive.
 #[test]
 fn graph_history_caps_at_max_robust() {
-    let _guard = graph_history_test_lock()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let _guard = graph_history_test_lock().blocking_lock();
     clear_graph_history();
     let fixtures = std::path::Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -1829,7 +1873,18 @@ async fn execute_grep_files_with_matches_mode_normal() {
 
 #[test]
 fn execute_task_create_without_store_fails_robust() {
-    let r = execute_task_create(None, "subj".into(), "desc".into(), None, vec![], None, None, None, None, None);
+    let r = execute_task_create(
+        None,
+        "subj".into(),
+        "desc".into(),
+        None,
+        vec![],
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
     assert!(r.is_error());
     assert!(r.output.contains("Task store not available"));
 }
@@ -1843,13 +1898,37 @@ fn execute_task_create_with_store_returns_task_json_normal() {
         "release v1".into(),
         None,
         vec![],
-        None, None, None, None, None,
+        None,
+        None,
+        None,
+        None,
+        None,
     );
     assert!(!r.is_error(), "{:?}", r);
     // The output is the JSON of the created task — should mention the
     // subject and a `t1` id.
     assert!(r.output.contains("ship"), "{}", r.output);
     assert!(r.output.contains("t1"), "{}", r.output);
+}
+
+#[test]
+fn execute_task_create_rejects_placeholder_fixture_robust() {
+    let store = TaskStore::in_memory();
+    let r = execute_task_create(
+        Some(store.clone()),
+        "subj".into(),
+        "desc".into(),
+        None,
+        vec![],
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    assert!(r.is_error(), "{:?}", r);
+    assert!(r.output.contains("placeholder"), "{}", r.output);
+    assert!(store.list(DeletedFilter::Include).is_empty());
 }
 
 #[test]
@@ -1861,14 +1940,20 @@ fn execute_task_create_with_unknown_dependency_fails_robust() {
         "y".into(),
         None,
         vec!["t999".into()],
-        None, None, None, None, None,
+        None,
+        None,
+        None,
+        None,
+        None,
     );
     assert!(r.is_error(), "{:?}", r);
 }
 
 #[test]
 fn execute_task_update_without_store_fails_robust() {
-    let r = execute_task_update(None, "t1", None, None, None, None, None, None, None, None, None);
+    let r = execute_task_update(
+        None, "t1", None, None, None, None, None, None, None, None, None,
+    );
     assert!(r.is_error());
 }
 
@@ -1881,7 +1966,11 @@ fn execute_task_update_changes_status_normal() {
         "do alpha".into(),
         None,
         vec![],
-        None, None, None, None, None,
+        None,
+        None,
+        None,
+        None,
+        None,
     );
     assert!(!create.is_error());
     // First-created task gets id `t1`.
@@ -1892,7 +1981,11 @@ fn execute_task_update_changes_status_normal() {
         None,
         None,
         None,
-        None, None, None, None, None,
+        None,
+        None,
+        None,
+        None,
+        None,
     );
     assert!(!r.is_error(), "{}", r.output);
     assert!(r.output.contains("in_progress"), "{}", r.output);
@@ -1901,7 +1994,18 @@ fn execute_task_update_changes_status_normal() {
 #[test]
 fn execute_task_update_invalid_status_fails_robust() {
     let store = TaskStore::in_memory();
-    execute_task_create(Some(store.clone()), "x".into(), "y".into(), None, vec![], None, None, None, None, None);
+    execute_task_create(
+        Some(store.clone()),
+        "x".into(),
+        "y".into(),
+        None,
+        vec![],
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
     let r = execute_task_update(
         Some(store),
         "t1",
@@ -1909,7 +2013,11 @@ fn execute_task_update_invalid_status_fails_robust() {
         Some("renamed".into()),
         None,
         None,
-        None, None, None, None, None,
+        None,
+        None,
+        None,
+        None,
+        None,
     );
     assert!(r.is_error(), "{}", r.output);
     assert!(r.output.contains("Invalid task status"), "{}", r.output);
@@ -1918,7 +2026,18 @@ fn execute_task_update_invalid_status_fails_robust() {
 #[test]
 fn execute_task_done_marks_completed_normal() {
     let store = TaskStore::in_memory();
-    execute_task_create(Some(store.clone()), "do".into(), "it".into(), None, vec![], None, None, None, None, None);
+    execute_task_create(
+        Some(store.clone()),
+        "do".into(),
+        "it".into(),
+        None,
+        vec![],
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
     let r = execute_task_done(Some(store), "t1");
     assert!(!r.is_error(), "{}", r.output);
     assert!(r.output.contains("completed"), "{}", r.output);
@@ -1946,7 +2065,11 @@ fn execute_task_list_returns_tasks_normal() {
         "first".into(),
         None,
         vec![],
-        None, None, None, None, None,
+        None,
+        None,
+        None,
+        None,
+        None,
     );
     execute_task_create(
         Some(store.clone()),
@@ -1954,7 +2077,11 @@ fn execute_task_list_returns_tasks_normal() {
         "second".into(),
         None,
         vec![],
-        None, None, None, None, None,
+        None,
+        None,
+        None,
+        None,
+        None,
     );
     let r = execute_task_list(Some(store), None, None);
     assert!(!r.is_error(), "{}", r.output);
@@ -1965,7 +2092,18 @@ fn execute_task_list_returns_tasks_normal() {
 #[test]
 fn execute_task_list_filters_by_owner_robust() {
     let store = TaskStore::in_memory();
-    execute_task_create(Some(store.clone()), "x".into(), "y".into(), None, vec![], None, None, None, None, None);
+    execute_task_create(
+        Some(store.clone()),
+        "x".into(),
+        "y".into(),
+        None,
+        vec![],
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
     execute_task_update(
         Some(store.clone()),
         "t1",
@@ -1973,7 +2111,11 @@ fn execute_task_list_filters_by_owner_robust() {
         None,
         None,
         Some("alice".into()),
-        None, None, None, None, None,
+        None,
+        None,
+        None,
+        None,
+        None,
     );
     let only_alice = execute_task_list(Some(store.clone()), None, Some("alice"));
     assert!(only_alice.output.contains("alice"), "{}", only_alice.output);
@@ -2200,6 +2342,55 @@ async fn execute_tool_invalidates_dedup_after_write_normal() {
         r2.output
     );
     assert!(r2.output.contains("v2"), "{}", r2.output);
+}
+
+#[serial_test::serial]
+#[test]
+fn scratchpad_round_trips_through_config_file_normal() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let prev = std::env::var("XDG_CONFIG_HOME").ok();
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", home.path()) };
+
+    let w = execute_scratchpad_write("agent-audit", "findings");
+    let r = execute_scratchpad_read("agent-audit");
+    let path = home.path().join("jfc").join("scratchpad.json");
+
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
+
+    assert!(!w.is_error(), "{}", w.output);
+    assert!(!r.is_error(), "{}", r.output);
+    assert_eq!(r.output, "findings");
+    assert!(
+        path.exists(),
+        "scratchpad must persist outside process memory"
+    );
+}
+
+#[serial_test::serial]
+#[test]
+fn scratchpad_missing_key_lists_persisted_keys_robust() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let prev = std::env::var("XDG_CONFIG_HOME").ok();
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", home.path()) };
+
+    let w = execute_scratchpad_write("known-key", "value");
+    let r = execute_scratchpad_read("missing-key");
+
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
+
+    assert!(!w.is_error(), "{}", w.output);
+    assert!(r.is_error());
+    assert!(r.output.contains("known-key"), "{}", r.output);
 }
 
 #[tokio::test]
@@ -2487,15 +2678,34 @@ async fn execute_remote_trigger_unknown_id_fails_robust() {
 
 // ─── EnterPlanMode tool ────────────────────────────────────────────────
 
+struct EventSenderResetGuard;
+
+impl Drop for EventSenderResetGuard {
+    fn drop(&mut self) {
+        clear_event_sender_for_test();
+    }
+}
+
+fn clear_event_sender_for_test() {
+    if let Ok(mut g) = active_event_sender_handle().write() {
+        *g = None;
+    }
+}
+
+#[serial_test::serial]
 #[tokio::test]
 async fn enter_plan_mode_dispatches_event_normal() {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::app::AppEvent>(8);
+    let _guard = EventSenderResetGuard;
+    clear_event_sender_for_test();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::runtime::AppEvent>(8);
     register_event_sender(tx);
     let r = execute_enter_plan_mode("safety check").await;
     assert!(!r.is_error(), "{}", r.output);
     let evt = rx.recv().await.expect("event");
     match evt {
-        crate::app::AppEvent::EnterPlanModeRequested { reason } => {
+        crate::runtime::AppEvent::Ui(crate::runtime::UiEvent::EnterPlanModeRequested {
+            reason,
+        }) => {
             assert_eq!(reason, "safety check");
         }
         _ => panic!("expected EnterPlanModeRequested AppEvent variant"),
@@ -2505,13 +2715,13 @@ async fn enter_plan_mode_dispatches_event_normal() {
 /// Robust: when no event sender is registered (e.g. early-boot tool
 /// calls or test setup that didn't wire one), the call fails with a
 /// clear message rather than panicking.
+#[serial_test::serial]
 #[tokio::test]
 async fn enter_plan_mode_without_sender_fails_robust() {
+    let _guard = EventSenderResetGuard;
     // Clear any previously-registered sender. We use a separate
     // process-global, so this requires reaching into the handle.
-    if let Ok(mut g) = active_event_sender_handle().write() {
-        *g = None;
-    }
+    clear_event_sender_for_test();
     let r = execute_enter_plan_mode("noop").await;
     assert!(r.is_error());
     assert!(r.output.contains("no event sender"), "{}", r.output);
@@ -2721,14 +2931,39 @@ fn graph_query_fixtures_dir() -> &'static Path {
     ))
 }
 
+#[tokio::test]
+async fn code_index_lists_filtered_symbols_normal() {
+    let fixtures = graph_query_fixtures_dir();
+    invalidate_graph_session_cache(Some(fixtures));
+
+    let result = execute_tool(
+        ToolKind::CodeIndex,
+        ToolInput::CodeIndex {
+            path: Some("sample.rs".into()),
+            query: Some("foo".into()),
+            kind: Some("function".into()),
+            max_entries: Some(10),
+        },
+        fixtures.to_path_buf(),
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(!result.is_error(), "{}", result.output);
+    assert!(result.output.contains("Code index"), "{}", result.output);
+    assert!(result.output.contains("sample.rs"), "{}", result.output);
+    assert!(result.output.contains("fn:"), "{}", result.output);
+    assert!(result.output.contains("foo"), "{}", result.output);
+}
+
 /// Normal: `union` set algebra reaches the new `run_query_expr` path
 /// (the legacy parser would reject the `union` keyword). The merged
 /// result must contain at least one match from each operand.
 #[tokio::test]
 async fn graph_query_runs_set_algebra_normal() {
-    let _guard = graph_history_test_lock()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let _guard = graph_history_test_lock().lock().await;
     clear_graph_history();
     let fixtures = graph_query_fixtures_dir();
     invalidate_graph_session_cache(Some(fixtures));
@@ -2757,9 +2992,7 @@ async fn graph_query_runs_set_algebra_normal() {
 /// along the chain. `a -> b -> c` exists in `deep_call_chain.rs`.
 #[tokio::test]
 async fn graph_query_runs_path_query_normal() {
-    let _guard = graph_history_test_lock()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let _guard = graph_history_test_lock().lock().await;
     clear_graph_history();
     let fixtures = graph_query_fixtures_dir();
     invalidate_graph_session_cache(Some(fixtures));
@@ -2796,9 +3029,7 @@ async fn graph_query_runs_path_query_normal() {
 /// `<kind>:<qualified_name>`.
 #[tokio::test]
 async fn graph_query_emits_handles_footer_normal() {
-    let _guard = graph_history_test_lock()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let _guard = graph_history_test_lock().lock().await;
     clear_graph_history();
     let fixtures = graph_query_fixtures_dir();
     invalidate_graph_session_cache(Some(fixtures));
@@ -2912,9 +3143,7 @@ fn graph_query_handles_footer_truncates_at_50_robust() {
 /// rather than crashing the dispatcher.
 #[tokio::test]
 async fn graph_query_returns_failure_on_parse_error_robust() {
-    let _guard = graph_history_test_lock()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let _guard = graph_history_test_lock().lock().await;
     clear_graph_history();
     let fixtures = graph_query_fixtures_dir();
     invalidate_graph_session_cache(Some(fixtures));
@@ -2944,4 +3173,27 @@ async fn graph_query_returns_failure_on_parse_error_robust() {
         "unexpected error message: {}",
         result.output
     );
+}
+
+// ─── defs.rs ↔ ToolKind drift guard ──────────────────────────────────
+//
+// defs.rs carries hand-written JSON schemas + LLM-facing prose; the prose
+// can't be macro-generated and the schemas vary too much to share a builder
+// without bloat (see the t13 investigation). Instead of forcing a macro
+// table, this test enforces the consistency guarantee a macro would have
+// given: every name in `all_tool_defs()` must round-trip through
+// `ToolKind::from_name` to a real (non-`UnknownTool`) variant. Adding a
+// `ToolDef` whose name doesn't match any `ToolKind`, or renaming a kind
+// without updating the def, fails here at test time.
+#[test]
+fn every_tool_def_name_resolves_to_a_real_tool_kind_robust() {
+    for def in all_tool_defs() {
+        let kind = ToolKind::from_name(&def.name);
+        assert!(
+            !matches!(kind, ToolKind::UnknownTool { .. }),
+            "ToolDef `{}` has no matching ToolKind — defs.rs has drifted \
+             from the enum (add the variant, or fix the def's name)",
+            def.name,
+        );
+    }
 }

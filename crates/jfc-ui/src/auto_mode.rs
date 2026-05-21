@@ -18,18 +18,18 @@
 //!
 //! This module owns the prompt assembly, config loading, default rules, and
 //! decision parsing. The actual API call lives in the provider's `complete()`
-//! impl (see [`crate::provider::Provider::complete`]).
+//! impl (see [`jfc_provider::Provider::complete`]).
 
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::provider::{
+use crate::types::{ChatMessage, MessagePart, Role, ToolCall};
+use jfc_provider::{
     CompletionResponse, Provider, ProviderContent, ProviderMessage, ProviderRole, StreamOptions,
     ToolDef,
 };
-use crate::types::{ChatMessage, MessagePart, Role, ToolCall};
 
 /// Result returned by the classifier.
 #[derive(Debug, Clone)]
@@ -274,10 +274,10 @@ pub fn build_transcript(messages: &[ChatMessage], pending: &ToolCall) -> String 
         match msg.role {
             Role::User => {
                 for part in &msg.parts {
-                    if let MessagePart::Text(t) = part {
-                        if !t.trim().is_empty() {
-                            out.push_str(&format!("User: {}\n\n", t.trim()));
-                        }
+                    if let MessagePart::Text(t) = part
+                        && !t.trim().is_empty()
+                    {
+                        out.push_str(&format!("User: {}\n\n", t.trim()));
                     }
                 }
             }
@@ -369,14 +369,12 @@ fn parse_classification(resp: &CompletionResponse) -> Option<ClassifyResult> {
     }
     // Some providers wrap the tool result in `{ "tool_use": {...} }` etc. Try
     // pulling the first JSON object out of the string.
-    if let Some(start) = s.find('{') {
-        if let Some(end) = s.rfind('}') {
-            if start < end {
-                if let Ok(v) = serde_json::from_str::<Value>(&s[start..=end]) {
-                    return parse_from_value(&v);
-                }
-            }
-        }
+    if let Some(start) = s.find('{')
+        && let Some(end) = s.rfind('}')
+        && start < end
+        && let Ok(v) = serde_json::from_str::<Value>(&s[start..=end])
+    {
+        return parse_from_value(&v);
     }
     None
 }
@@ -426,6 +424,7 @@ mod tests {
             display: crate::types::ToolDisplayState::Collapsed,
             elapsed_ms: None,
             started_at: None,
+            thought_signature: None,
         }
     }
 
@@ -614,10 +613,10 @@ mod tests {
 
     // ─── Fake provider for classify() tests ───────────────────────────────
 
-    use crate::provider::{
+    use async_trait::async_trait;
+    use jfc_provider::{
         EventStream, ModelInfo, ProviderMessage as PMsg, StreamConvention, StreamOptions as SOpts,
     };
-    use async_trait::async_trait;
 
     struct FakeProvider {
         // What complete() should return.
@@ -686,7 +685,7 @@ mod tests {
                 .expect("FakeProvider::complete called more than once")
         }
     }
-    impl crate::provider::seal::Sealed for FakeProvider {}
+    impl jfc_provider::seal::Sealed for FakeProvider {}
 
     // Normal: when the fake provider returns an "allow" decision, classify
     // surfaces it.

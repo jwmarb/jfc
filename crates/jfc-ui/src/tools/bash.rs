@@ -2,10 +2,12 @@ use std::path::Path;
 
 use tracing::{debug, info, warn};
 
-use super::{
-    ExecutionResult, ToolProvenance, ToolSource, configure_tool_command,
-    non_interactive_shell_command, terminal_safe_text,
+use super::safe_tools::{
+    configure_tool_command, non_interactive_shell_command, terminal_safe_text,
 };
+use super::{ExecutionResult, ToolProvenance, ToolSource};
+
+type ProgressSink = Option<(String, tokio::sync::mpsc::Sender<crate::runtime::AppEvent>)>;
 
 pub(super) async fn execute_bash(
     command: &str,
@@ -15,17 +17,48 @@ pub(super) async fn execute_bash(
     execute_bash_inner(command, timeout_ms, cwd, None).await
 }
 
+async fn collect_streaming_pipe<R>(pipe: Option<R>, progress: ProgressSink) -> String
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let Some(pipe) = pipe else {
+        return String::new();
+    };
+    let mut reader = BufReader::new(pipe).lines();
+    let mut buf = String::new();
+    loop {
+        match reader.next_line().await {
+            Ok(Some(line)) => {
+                let safe = terminal_safe_text(&line);
+                buf.push_str(&safe);
+                buf.push('\n');
+                if let Some((tool_id, tx)) = &progress {
+                    let _ = tx.try_send(crate::runtime::AppEvent::Tool(
+                        crate::runtime::ToolEvent::OutputChunk {
+                            tool_id: crate::ids::ToolId::from(tool_id.clone()),
+                            chunk: safe,
+                        },
+                    ));
+                }
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    buf
+}
+
 /// Execute bash with optional streaming progress. When `progress_tx` is
-/// provided, stdout lines are streamed to the UI in real-time via
+/// provided, stdout/stderr lines are streamed to the UI in real-time via
 /// `ToolOutputChunk` events.
 pub(super) async fn execute_bash_inner(
     command: &str,
     timeout_ms: Option<u64>,
     cwd: &Path,
-    progress: Option<(String, tokio::sync::mpsc::Sender<crate::app::AppEvent>)>,
+    progress: Option<(String, tokio::sync::mpsc::Sender<crate::runtime::AppEvent>)>,
 ) -> ExecutionResult {
     use std::process::Stdio;
-    use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::process::Command;
 
     let timeout = timeout_ms.unwrap_or(120_000);
@@ -67,10 +100,72 @@ pub(super) async fn execute_bash_inner(
         .env_remove("FORCE_COLOR")
         .env_remove("GREP_COLORS")
         .env_remove("LS_COLORS");
+    // Security-critical env-pin (recommendation #4 from the bash-CVE
+    // research). These variables are the documented vectors for
+    // "child process RCE from a parent that looked benign":
+    //   * LD_PRELOAD / LD_AUDIT / LD_LIBRARY_PATH — inject shared
+    //     libraries into every spawned binary. Even a `date` invocation
+    //     becomes a code-exec primitive.
+    //   * BASH_ENV / ENV — bash sources this file on non-interactive
+    //     startup (Shellshock-era vector).
+    //   * PROMPT_COMMAND / PS0..PS4 — command-substituted on each
+    //     prompt; `@P}` expansion (Flatt #8) hooks here.
+    //   * IFS — re-tokenizes the rest of the command line; setting
+    //     it to a digit defeats parser anchors.
+    //   * GIT_EXTERNAL_DIFF / GIT_SSH_COMMAND / GIT_DIR /
+    //     GIT_ALTERNATE_OBJECT_DIRECTORIES — git RCE via config-hook
+    //     equivalents (github.blog: git-security-vulnerabilities-
+    //     announced-4).
+    //   * MANPAGER / LESS / MANROFFSEQ — man-page viewers that exec
+    //     filters; less in particular runs `!` commands.
+    //   * BASH_FUNC_*() / shellshock — bash <4.3 parses these as
+    //     function definitions in the env. `env_clear` would also
+    //     work but we want to keep PATH and standard locale vars.
+    cmd.env_remove("LD_PRELOAD")
+        .env_remove("LD_AUDIT")
+        .env_remove("LD_LIBRARY_PATH")
+        .env_remove("LD_BIND_NOW")
+        .env_remove("DYLD_INSERT_LIBRARIES") // macOS equivalent of LD_PRELOAD
+        .env_remove("DYLD_LIBRARY_PATH")
+        .env_remove("BASH_ENV")
+        .env_remove("ENV")
+        .env_remove("PROMPT_COMMAND")
+        .env_remove("PS0")
+        .env_remove("PS1")
+        .env_remove("PS2")
+        .env_remove("PS3")
+        .env_remove("PS4")
+        .env_remove("IFS")
+        .env_remove("CDPATH")
+        .env_remove("GLOBIGNORE")
+        .env_remove("HISTFILE")
+        .env_remove("HISTCMD")
+        .env_remove("GIT_EXTERNAL_DIFF")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_SSH_COMMAND")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_CONFIG")
+        .env_remove("GIT_CONFIG_GLOBAL")
+        .env_remove("GIT_CONFIG_SYSTEM")
+        .env_remove("MANPAGER")
+        .env_remove("LESS")
+        .env_remove("LESSOPEN")
+        .env_remove("LESSCLOSE")
+        .env_remove("MANROFFSEQ")
+        .env_remove("MANROFFOPT")
+        // Pin PAGER, MANPAGER explicitly to cat — any tool that
+        // honors them now goes through a deterministic, non-exec
+        // viewer. (Already had PAGER above; MANPAGER added here.)
+        .env("MANPAGER", "cat")
+        .env("PAGER", "cat");
     configure_tool_command(&mut cmd);
 
-    // If streaming, pipe stdout and read line-by-line
-    if let Some((ref tool_id, ref tx)) = progress {
+    // If streaming, pipe stdout/stderr and drain both concurrently. Reading
+    // stdout to EOF before stderr can deadlock commands that write enough
+    // diagnostics to fill the stderr pipe (cargo/rustc are common examples).
+    if progress.is_some() {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let spawn_result = cmd.spawn();
         match spawn_result {
@@ -82,59 +177,25 @@ pub(super) async fn execute_bash_inner(
                 let _pid_guard = child.id().map(crate::bash_processes::PidGuard::register);
                 let stdout = child.stdout.take();
                 let stderr = child.stderr.take();
-                let mut stdout_buf = String::new();
-                let mut stderr_buf = String::new();
-
-                // Stream stdout line-by-line
-                if let Some(stdout) = stdout {
-                    let mut reader = BufReader::new(stdout).lines();
-                    let deadline =
-                        tokio::time::Instant::now() + std::time::Duration::from_millis(timeout);
-                    loop {
-                        let line = tokio::time::timeout_at(deadline, reader.next_line()).await;
-                        match line {
-                            Ok(Ok(Some(l))) => {
-                                // Strip ANSI / control bytes BEFORE the
-                                // chunk goes anywhere — the UI's
-                                // sanitize_terminal_text scrubber runs
-                                // at draw-time but the raw bytes still
-                                // sit in app state and can corrupt the
-                                // TUI buffer if they slip through. Bug:
-                                // git's `--stat` output occasionally
-                                // includes box-drawing or backspace
-                                // sequences depending on locale, and
-                                // those leaked through the streaming
-                                // path (the non-streaming path already
-                                // scrubs at line 167).
-                                let safe = super::terminal_safe_text(&l);
-                                stdout_buf.push_str(&safe);
-                                stdout_buf.push('\n');
-                                // Send chunk to UI (non-blocking)
-                                let _ = tx.try_send(crate::app::AppEvent::ToolOutputChunk {
-                                    tool_id: crate::ids::ToolId::from(tool_id.clone()),
-                                    chunk: safe,
-                                });
-                            }
-                            Ok(Ok(None)) => break, // EOF
-                            Ok(Err(_)) => break,   // read error
-                            Err(_) => {
-                                // Timeout — kill the process
-                                let _ = child.kill().await;
-                                return ExecutionResult::failure(format!(
-                                    "Command timed out (streaming)"
-                                ));
-                            }
-                        }
+                let stdout_task = tokio::spawn(collect_streaming_pipe(stdout, progress.clone()));
+                let stderr_task = tokio::spawn(collect_streaming_pipe(stderr, progress.clone()));
+                let status =
+                    tokio::time::timeout(std::time::Duration::from_millis(timeout), child.wait())
+                        .await;
+                let status = match status {
+                    Ok(status) => status,
+                    Err(_) => {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        stdout_task.abort();
+                        stderr_task.abort();
+                        return ExecutionResult::failure(
+                            "Command timed out (streaming)".to_string(),
+                        );
                     }
-                }
-
-                // Collect stderr (not streamed — shown at end)
-                if let Some(mut stderr) = stderr {
-                    use tokio::io::AsyncReadExt;
-                    let _ = stderr.read_to_string(&mut stderr_buf).await;
-                }
-
-                let status = child.wait().await;
+                };
+                let stdout_buf = stdout_task.await.unwrap_or_default();
+                let stderr_buf = stderr_task.await.unwrap_or_default();
                 let exit = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
                 debug!(target: "jfc::tools", exit_code = exit, stdout_len = stdout_buf.len(), stderr_len = stderr_buf.len(), "bash: completed (streamed)");
 

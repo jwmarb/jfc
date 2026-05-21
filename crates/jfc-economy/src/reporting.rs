@@ -241,6 +241,21 @@ pub trait AgentInvoker: Send + Sync {
     /// determines the solution is sound — sealed validation means
     /// validators don't see each other's verdicts during this call.
     async fn invoke_validator(&self, prompt: ValidatorPrompt) -> Result<ValidatorOutcome, String>;
+
+    /// Mechanistically adjudicate a validator's proposed test by actually
+    /// compiling and running it inside the solver's worktree. Returns `true`
+    /// if the test fails (proving the flaw is real), `false` otherwise
+    /// (test passes, doesn't compile, or no worktree available).
+    ///
+    /// Default implementation returns `false` (conservative: flaw not proven)
+    /// so existing test mocks don't break.
+    async fn adjudicate_test(
+        &self,
+        _test_code: &str,
+        _worktree: Option<&Path>,
+    ) -> bool {
+        false
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -408,7 +423,7 @@ mod tests {
         let session = orchestrator.validators.get_mut(session_idx).unwrap();
         session
             .submit_challenge(ValidationChallenge {
-                validator_id: validator.clone(),
+                validator_id: validator,
                 solution_agent_id: solver_a.clone(),
                 bounty_id: bounty_id.clone(),
                 proposed_flaw: "".into(),
@@ -438,7 +453,7 @@ mod tests {
             &bounty_id,
             1000,
             Some(&solver_a),
-            &[solver_b.clone()],
+            std::slice::from_ref(&solver_b),
             &verdicts,
             &charter,
             &mut orchestrator.ledger,
@@ -476,7 +491,7 @@ mod tests {
         let charter = Charter::default();
         let mut orchestrator = MarketOrchestrator::with_budget(charter, 500);
         // Post a bounty within charter limits
-        let _ = orchestrator
+        orchestrator
             .post_bounty("test".into(), 400, "test".into(), None)
             .unwrap();
         // Nothing spent yet (just posted, no settlement)

@@ -4,7 +4,7 @@ use tracing::{debug, info, warn};
 
 use super::ExecutionResult;
 use super::subagent::execute_skill_in;
-use crate::tasks::{DeletedFilter, TaskKind, TaskPatch, TaskRisk, TaskStatus, TaskStore};
+use jfc_session::{DeletedFilter, TaskKind, TaskPatch, TaskRisk, TaskStatus, TaskStore};
 
 pub(super) fn execute_task_create(
     store: Option<Arc<TaskStore>>,
@@ -22,6 +22,16 @@ pub(super) fn execute_task_create(
     let Some(store) = store else {
         return ExecutionResult::failure("Task store not available");
     };
+    if is_placeholder_task_input(&subject, &description) {
+        warn!(
+            target: "jfc::tools",
+            %subject,
+            "task_create: rejected placeholder task"
+        );
+        return ExecutionResult::failure(
+            "TaskCreate rejected placeholder subject/description; provide a real task title and description",
+        );
+    }
     match store.create(subject, description, active_form, blocked_by) {
         Ok(task) => {
             // Apply optional extended fields via a patch
@@ -37,7 +47,7 @@ pub(super) fn execute_task_create(
                     acceptance_criteria,
                     verification_command,
                     risk: parsed_risk,
-                    parent_id: parent_id.map(crate::tasks::TaskId::from),
+                    parent_id: parent_id.map(jfc_session::TaskId::from),
                     kind: parsed_kind,
                     ..Default::default()
                 };
@@ -64,6 +74,10 @@ pub(super) fn execute_task_create(
             ExecutionResult::failure(e.to_string())
         }
     }
+}
+
+fn is_placeholder_task_input(subject: &str, description: &str) -> bool {
+    subject.trim().eq_ignore_ascii_case("subj") && description.trim().eq_ignore_ascii_case("desc")
 }
 
 pub(super) fn execute_task_update(
@@ -104,7 +118,7 @@ pub(super) fn execute_task_update(
         acceptance_criteria,
         verification_command,
         risk: risk.as_deref().and_then(parse_risk),
-        parent_id: parent_id.map(crate::tasks::TaskId::from),
+        parent_id: parent_id.map(jfc_session::TaskId::from),
         kind: kind.as_deref().and_then(parse_kind),
         ..Default::default()
     };
@@ -128,8 +142,8 @@ pub(super) fn execute_task_validate(store: Option<Arc<TaskStore>>) -> ExecutionR
         return ExecutionResult::failure("Task store not available");
     };
     let validation = store.validate();
-    let output = serde_json::to_string_pretty(&validation)
-        .unwrap_or_else(|_| format!("{validation:?}"));
+    let output =
+        serde_json::to_string_pretty(&validation).unwrap_or_else(|_| format!("{validation:?}"));
     ExecutionResult::success(output)
 }
 
@@ -184,6 +198,90 @@ pub(super) fn execute_task_done(store: Option<Arc<TaskStore>>, task_id: &str) ->
     let Some(store) = store else {
         return ExecutionResult::failure("Task store not available");
     };
+
+    // Verification gate: if the task has a verification_command, run it
+    // before allowing completion. This prevents stub/incomplete work from
+    // being marked done — the command must exit 0.
+    if let Some(task) = store.get(task_id)
+        && let Some(ref cmd) = task.verification_command
+        && !cmd.trim().is_empty()
+    {
+        debug!(
+            target: "jfc::tools",
+            task_id,
+            cmd,
+            "task_done: running verification command"
+        );
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(cmd)
+            .output();
+        match output {
+            Ok(result) if result.status.success() => {
+                debug!(
+                    target: "jfc::tools",
+                    task_id,
+                    "task_done: verification passed"
+                );
+            }
+            Ok(result) => {
+                let stderr = String::from_utf8_lossy(&result.stderr);
+                let stdout = String::from_utf8_lossy(&result.stdout);
+                let truncated_output: String = format!(
+                    "stdout: {}\nstderr: {}",
+                    &stdout[..stdout.len().min(500)],
+                    &stderr[..stderr.len().min(500)]
+                );
+                warn!(
+                    target: "jfc::tools",
+                    task_id,
+                    exit_code = ?result.status.code(),
+                    "task_done: verification FAILED — task remains in_progress"
+                );
+                return ExecutionResult::failure(format!(
+                    "Verification failed (exit {}). Task remains in_progress.\n\
+                             Command: {cmd}\n{truncated_output}",
+                    result.status.code().unwrap_or(-1)
+                ));
+            }
+            Err(e) => {
+                warn!(
+                    target: "jfc::tools",
+                    task_id,
+                    error = %e,
+                    "task_done: verification command failed to execute"
+                );
+                return ExecutionResult::failure(format!(
+                    "Verification command failed to execute: {e}. Task remains in_progress."
+                ));
+            }
+        }
+    }
+
+    // Evaluator gate: scan recently-modified files for stub patterns
+    // (todo!(), unimplemented!(), etc.). Only fires when a git root is
+    // discoverable AND we're not in a test environment (tests run in the
+    // repo itself and would always find TODOs in unrelated files).
+    // Disable with JFC_SKIP_EVALUATOR=1 for CI/test contexts.
+    if std::env::var("JFC_SKIP_EVALUATOR").is_err()
+        && !cfg!(test)
+        && let Some(root) = crate::context::discover_git_root()
+    {
+        let eval = crate::sprint::evaluate_work_quality(&root);
+        if !eval.passed {
+            warn!(
+                target: "jfc::tools",
+                task_id,
+                issue_count = eval.issues.len(),
+                "task_done: evaluator detected stub patterns — rejecting completion"
+            );
+            return ExecutionResult::failure(format!(
+                "Evaluator rejected: stub/placeholder patterns found in modified files. \
+                 Fix these before marking done.\n\n{eval}"
+            ));
+        }
+    }
+
     let patch = TaskPatch {
         status: Some(TaskStatus::Completed),
         ..Default::default()
@@ -200,6 +298,16 @@ pub(super) fn execute_task_done(store: Option<Arc<TaskStore>>, task_id: &str) ->
             ExecutionResult::failure(e.to_string())
         }
     }
+}
+
+pub(super) fn execute_task_stop(_app: &str, task_id: &str) -> ExecutionResult {
+    debug!(target: "jfc::tools", task_id, "task_stop: requesting stop");
+    // TaskStop is handled specially by the runtime event loop which has
+    // access to App. We return a success message here and the event loop
+    // performs the actual cancellation when it processes the tool result.
+    ExecutionResult::success(format!(
+        "Stop signal sent to task {task_id}. The runtime will cancel it."
+    ))
 }
 
 pub(super) fn execute_task_get(store: Option<Arc<TaskStore>>, task_id: &str) -> ExecutionResult {

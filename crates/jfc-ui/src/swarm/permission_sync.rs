@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Permission synchronization between swarm workers and the team leader.
 //!
 //! When a worker agent encounters a tool that requires user approval, it sends
@@ -114,12 +113,11 @@ pub async fn read_pending_permissions(team_name: &str) -> Vec<SwarmPermissionReq
     let mut results = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
-        if path.extension().is_some_and(|e| e == "json") {
-            if let Ok(content) = fs::read_to_string(&path).await {
-                if let Ok(request) = serde_json::from_str::<SwarmPermissionRequest>(&content) {
-                    results.push(request);
-                }
-            }
+        if path.extension().is_some_and(|e| e == "json")
+            && let Ok(content) = fs::read_to_string(&path).await
+            && let Ok(request) = serde_json::from_str::<SwarmPermissionRequest>(&content)
+        {
+            results.push(request);
         }
     }
 
@@ -215,6 +213,7 @@ pub async fn poll_for_response(
 }
 
 /// Clean up old resolved permission files (> max_age old).
+#[allow(dead_code)]
 pub async fn cleanup_old_resolutions(team_name: &str, max_age: Duration) -> u32 {
     let dir = resolved_dir(team_name);
     let mut entries = match fs::read_dir(&dir).await {
@@ -228,15 +227,14 @@ pub async fn cleanup_old_resolutions(team_name: &str, max_age: Duration) -> u32 
 
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
-        if path.extension().is_some_and(|e| e == "json") {
-            if let Ok(content) = fs::read_to_string(&path).await {
-                if let Ok(req) = serde_json::from_str::<SwarmPermissionRequest>(&content) {
-                    let resolved_at = req.resolved_at.unwrap_or(req.created_at);
-                    if now.saturating_sub(resolved_at) >= max_age_ms {
-                        let _ = fs::remove_file(&path).await;
-                        cleaned += 1;
-                    }
-                }
+        if path.extension().is_some_and(|e| e == "json")
+            && let Ok(content) = fs::read_to_string(&path).await
+            && let Ok(req) = serde_json::from_str::<SwarmPermissionRequest>(&content)
+        {
+            let resolved_at = req.resolved_at.unwrap_or(req.created_at);
+            if now.saturating_sub(resolved_at) >= max_age_ms {
+                let _ = fs::remove_file(&path).await;
+                cleaned += 1;
             }
         }
     }

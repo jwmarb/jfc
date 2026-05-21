@@ -145,35 +145,35 @@ pub(super) fn colorize_git_log_line(
         ),
         Span::styled(" ".to_owned(), Style::default().fg(fallback)),
     ];
-    if let Some(rest2) = rest.strip_prefix('(') {
-        if let Some(end) = rest2.find(')') {
-            let refs = &rest2[..end];
-            spans.push(Span::styled("(".to_owned(), Style::default().fg(t.warning)));
-            for (i, part) in refs.split(", ").enumerate() {
-                if i > 0 {
-                    spans.push(Span::styled(
-                        ", ".to_owned(),
-                        Style::default().fg(t.warning),
-                    ));
-                }
-                let style = if part.starts_with("HEAD") {
-                    Style::default().fg(t.accent).add_modifier(Modifier::BOLD)
-                } else if part.starts_with("origin/") || part.starts_with("upstream/") {
-                    Style::default().fg(t.error)
-                } else if part.starts_with("tag:") {
-                    Style::default().fg(t.warning)
-                } else {
-                    Style::default().fg(t.success)
-                };
-                spans.push(Span::styled(part.to_owned(), style));
+    if let Some(rest2) = rest.strip_prefix('(')
+        && let Some(end) = rest2.find(')')
+    {
+        let refs = &rest2[..end];
+        spans.push(Span::styled("(".to_owned(), Style::default().fg(t.warning)));
+        for (i, part) in refs.split(", ").enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(
+                    ", ".to_owned(),
+                    Style::default().fg(t.warning),
+                ));
             }
-            spans.push(Span::styled(")".to_owned(), Style::default().fg(t.warning)));
-            spans.push(Span::styled(
-                rest2[end + 1..].to_owned(),
-                Style::default().fg(fallback),
-            ));
-            return Some(spans);
+            let style = if part.starts_with("HEAD") {
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD)
+            } else if part.starts_with("origin/") || part.starts_with("upstream/") {
+                Style::default().fg(t.error)
+            } else if part.starts_with("tag:") {
+                Style::default().fg(t.warning)
+            } else {
+                Style::default().fg(t.success)
+            };
+            spans.push(Span::styled(part.to_owned(), style));
         }
+        spans.push(Span::styled(")".to_owned(), Style::default().fg(t.warning)));
+        spans.push(Span::styled(
+            rest2[end + 1..].to_owned(),
+            Style::default().fg(fallback),
+        ));
+        return Some(spans);
     }
     spans.push(Span::styled(rest.to_owned(), Style::default().fg(fallback)));
     Some(spans)
@@ -188,9 +188,8 @@ pub(super) fn colorize_git_commit_line(
     if line.starts_with('[') {
         let close = line.find(']')?;
         let inside = &line[1..close];
-        let mut parts = inside.splitn(2, ' ');
-        let branch = parts.next()?;
-        let hash = parts.next()?;
+        let (branch, hash) = inside.split_once(' ')?;
+
         let subject = &line[close + 1..];
         if !hash.chars().all(|c| c.is_ascii_hexdigit()) {
             return None;
@@ -409,10 +408,9 @@ pub(super) fn colorize_diagnostic_prefix(
         ("note: ", Style::default().fg(t.accent), r)
     } else if let Some(r) = trimmed.strip_prefix("help: ") {
         ("help: ", Style::default().fg(t.success), r)
-    } else if let Some(r) = trimmed.strip_prefix("usage: ") {
-        ("usage: ", Style::default().fg(t.warning), r)
     } else {
-        return None;
+        let r = trimmed.strip_prefix("usage: ")?;
+        ("usage: ", Style::default().fg(t.warning), r)
     };
     Some(vec![
         Span::styled(leading_ws.to_owned(), Style::default().fg(fallback)),

@@ -1,14 +1,15 @@
 use super::core::RenderItem;
 use super::*;
 
+#[allow(dead_code)]
 pub(super) fn render_assistant_text_lines<'a>(
     text: &'a str,
     t: &'a Theme,
     width: usize,
-    convention: crate::provider::StreamConvention,
+    convention: jfc_provider::StreamConvention,
 ) -> Vec<Line<'static>> {
     use crate::inline_tools::{self, Segment as InlineSeg};
-    use crate::provider::StreamConvention as SC;
+    use jfc_provider::StreamConvention as SC;
 
     let needs_inline = matches!(convention, SC::InlineXmlTags)
         || (matches!(convention, SC::AnthropicNative | SC::OpenAiNative)
@@ -69,8 +70,9 @@ pub(super) fn render_assistant_text_lines<'a>(
     lines
 }
 
+#[allow(dead_code)]
 fn streaming_task_footer_lines(app: &App, t: &Theme) -> Vec<Line<'static>> {
-    use crate::tasks::{DeletedFilter, TaskStatus};
+    use jfc_session::{DeletedFilter, TaskStatus};
 
     let tasks = app.task_store.list(DeletedFilter::Exclude);
     if tasks.is_empty() {
@@ -87,18 +89,18 @@ fn streaming_task_footer_lines(app: &App, t: &Theme) -> Vec<Line<'static>> {
 
     let fade_dur = std::time::Duration::from_secs(30);
     let now = std::time::Instant::now();
-    let recently_completed: Vec<&crate::tasks::Task> = tasks
+    let recently_completed: Vec<&jfc_session::Task> = tasks
         .iter()
         .filter(|tk| {
             tk.status == TaskStatus::Completed
                 && app
                     .task_completion_times
                     .get(&tk.id)
-                    .map_or(false, |&t| now.duration_since(t) < fade_dur)
+                    .is_some_and(|&t| now.duration_since(t) < fade_dur)
         })
         .collect();
 
-    let open_tasks: Vec<&crate::tasks::Task> = tasks
+    let open_tasks: Vec<&jfc_session::Task> = tasks
         .iter()
         .filter(|tk| matches!(tk.status, TaskStatus::Pending | TaskStatus::InProgress))
         .collect();
@@ -367,14 +369,22 @@ pub(super) fn push_task_status_lines<'a>(
     } else {
         summary
     };
-    items.push(RenderItem::TextLine(Line::from(vec![
+    let mut spans = vec![
         Span::styled(format!("{icon} task "), style),
         Span::styled(
             header_label.to_owned(),
             Style::default().fg(t.text_secondary),
         ),
         Span::styled(elapsed, Style::default().fg(t.text_muted)),
-    ])));
+    ];
+    if let Some(model) = ts.model.as_deref() {
+        let badge = pretty_model_badge(model);
+        spans.push(Span::styled(
+            format!(" · {badge}"),
+            Style::default().fg(t.text_muted),
+        ));
+    }
+    items.push(RenderItem::TextLine(Line::from(spans)));
 
     if summary_is_block {
         const MAX_LINES: usize = 120;
@@ -404,6 +414,21 @@ pub(super) fn push_task_status_lines<'a>(
             Span::styled(err.clone(), Style::default().fg(t.text_secondary)),
         ])));
     }
+}
+
+/// Compact a provider-qualified model id into the short tail a human reads at
+/// a glance. `bedrock-claude-4-6-haiku` → `haiku`, `claude-opus-4-7` → `opus`,
+/// `claude-haiku-4-5-20251001` → `haiku`. Leaves unrecognized ids untouched
+/// (truncated only to fit the inline badge), so an "Explore uses haiku while
+/// main runs on opus" distinction lands as `haiku` vs `opus`.
+pub fn pretty_model_badge(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    for variant in ["haiku", "sonnet", "opus"] {
+        if lower.contains(variant) {
+            return variant.to_owned();
+        }
+    }
+    truncate_str(raw, 24)
 }
 
 pub(super) fn truncate_str(s: &str, max: usize) -> String {

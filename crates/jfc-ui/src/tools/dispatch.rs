@@ -1,0 +1,783 @@
+/// Main tool dispatcher for jfc.
+/// Contains the `execute_tool` async fn and all its match arms.
+/// State helpers live in `registry`; synchronous helpers in `safe_tools`.
+use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+use crate::context::ReadDedupCache;
+use crate::runtime::ExecutionResult;
+use crate::types::{ToolInput, ToolKind};
+use jfc_session::TaskStore;
+
+use super::bash::execute_bash;
+use super::daemon::{
+    execute_cron_create, execute_cron_delete, execute_cron_list, execute_monitor,
+    execute_schedule_wakeup,
+};
+use super::dispatch_heavy;
+use super::economy::strip_html_tags;
+use super::filesystem::{execute_edit, execute_read, execute_write};
+use super::lsp::execute_lsp;
+use super::memory::{execute_memory_create, execute_memory_delete};
+use super::notebook::{execute_notebook_edit, execute_notebook_read};
+use super::notifications::{execute_push_notification, execute_remote_trigger};
+use super::scratchpad::{execute_scratchpad_read, execute_scratchpad_write};
+use super::search::{execute_glob, execute_grep};
+use super::swarm::{
+    execute_send_message, execute_team_create, execute_team_delete, execute_team_member_mode,
+};
+use super::tasks::{
+    execute_skill, execute_task_create, execute_task_done, execute_task_get, execute_task_list,
+    execute_task_stop, execute_task_update, execute_task_validate,
+};
+use super::worktree::{execute_enter_plan_mode, execute_enter_worktree, execute_exit_worktree};
+
+use super::registry::{
+    collusion_detector, invalidate_graph_session_cache, market_orchestrator, record_edited_file,
+    snapshot_event_sender, snapshot_mcp_registry,
+};
+#[cfg(feature = "permission-automation")]
+use super::safe_tools::tool_permission_path;
+use super::safe_tools::{
+    execute_code_index, execute_tool_search, execute_tool_suggest, maybe_run_slop_guard,
+};
+
+#[tracing::instrument(target = "jfc::tools", skip(input, cwd, dedup, task_store), fields(kind = ?kind))]
+pub async fn execute_tool(
+    kind: ToolKind,
+    input: ToolInput,
+    cwd: std::path::PathBuf,
+    dedup: Option<Arc<Mutex<ReadDedupCache>>>,
+    task_store: Option<Arc<TaskStore>>,
+    active_team_name: Option<&str>,
+) -> ExecutionResult {
+    #[cfg(feature = "hooks")]
+    {
+        // Hook integration point: BeforeToolDispatch
+        // When fully wired, this will:
+        // 1. Build HookContext from tool name + input
+        // 2. Fire BeforeToolDispatch hooks
+        // 3. If Abort → return error
+        // 4. If Skip → return empty result
+        // 5. If Replace → use replacement input
+        tracing::trace!(target: "jfc::hooks", "hook integration point: BeforeToolDispatch");
+    }
+
+    #[cfg(feature = "permission-automation")]
+    {
+        use crate::permissions::{PermissionAction, check_tool_permission};
+
+        let config = crate::config::feature_config::FeatureConfig::load(&cwd);
+        let rules = crate::permissions::RuleSet::from_config(&config);
+        let decision = check_tool_permission(&rules, kind.api_name(), tool_permission_path(&input));
+
+        if matches!(decision.action, PermissionAction::Deny) {
+            let reason = decision
+                .reason
+                .as_deref()
+                .unwrap_or("permission rule denied tool invocation");
+            return ExecutionResult::failure(format!(
+                "Permission denied for {}: {reason}",
+                kind.api_name()
+            ));
+        }
+    }
+
+    // For task tools in team mode, prefer the caller-supplied store if
+    // one was passed (the UI keeps `app.task_store` pointing at the
+    // team's `tasks.json` once team mode is active, and the event-loop
+    // migration runs at TeammateSpawned). Only fall back to
+    // `TaskStore::open_team` when the caller didn't thread a store —
+    // e.g. the swarm runner's tool path. Without this guard, every
+    // concurrent task tool would `open_team` its own fresh
+    // `Arc<TaskStore>`, each with its own private `Mutex<TaskStoreInner>`,
+    // and last-write-wins on `tasks.json` would silently drop sibling
+    // task creates — the "unknown task id t35..t46" symptom.
+    let task_store = match (active_team_name, &kind, task_store.clone()) {
+        (
+            Some(team_name),
+            ToolKind::TaskCreate
+            | ToolKind::TaskUpdate
+            | ToolKind::TaskList
+            | ToolKind::TaskDone
+            | ToolKind::TaskStop
+            | ToolKind::TaskGet,
+            None,
+        ) => Some(TaskStore::open_team(team_name)),
+        (_, _, Some(store)) => Some(store),
+        _ => task_store,
+    };
+
+    match (kind, input) {
+        (
+            ToolKind::Bash,
+            ToolInput::Bash {
+                command, timeout, ..
+            },
+        ) => execute_bash(&command, timeout, &cwd).await,
+        (
+            ToolKind::Read,
+            ToolInput::Read {
+                file_path,
+                offset,
+                limit,
+            },
+        ) => execute_read(&file_path, offset, limit, dedup.as_ref()).await,
+        (ToolKind::Write, ToolInput::Write { file_path, content }) => {
+            let result = execute_write(&file_path, &content).await;
+            if !result.is_error() {
+                if let Some(cache) = &dedup {
+                    cache.lock().await.invalidate(Path::new(&file_path));
+                }
+                // Drop the cached graph for this workspace so the next
+                // graph_query reflects the new file content.
+                invalidate_graph_session_cache(Some(&cwd));
+                record_edited_file(Path::new(&file_path));
+                // Slop guard: check the written content for quality issues.
+                return maybe_run_slop_guard(result, Path::new(&file_path), &content, &cwd).await;
+            }
+            result
+        }
+        (
+            ToolKind::Edit,
+            ToolInput::Edit {
+                file_path,
+                old_string,
+                new_string,
+                replacement,
+            },
+        ) => {
+            let result = execute_edit(&file_path, &old_string, &new_string, replacement).await;
+            if !result.is_error() {
+                if let Some(cache) = &dedup {
+                    cache.lock().await.invalidate(Path::new(&file_path));
+                }
+                invalidate_graph_session_cache(Some(&cwd));
+                record_edited_file(Path::new(&file_path));
+                // Slop guard: read the post-edit content and check for quality issues.
+                let post_content = tokio::fs::read_to_string(&file_path)
+                    .await
+                    .unwrap_or_default();
+                return maybe_run_slop_guard(result, Path::new(&file_path), &post_content, &cwd)
+                    .await;
+            }
+            result
+        }
+        (ToolKind::Glob, ToolInput::Glob { pattern, path }) => {
+            execute_glob(&pattern, path.as_deref(), &cwd).await
+        }
+        (
+            ToolKind::Grep,
+            ToolInput::Grep {
+                pattern,
+                path,
+                glob,
+                output_mode,
+            },
+        ) => {
+            execute_grep(
+                &pattern,
+                path.as_deref(),
+                glob.as_deref(),
+                output_mode.as_deref(),
+                &cwd,
+            )
+            .await
+        }
+        (
+            ToolKind::TaskCreate,
+            ToolInput::TaskCreate {
+                subject,
+                description,
+                active_form,
+                blocked_by,
+                acceptance_criteria,
+                verification_command,
+                risk,
+                parent_id,
+                kind,
+            },
+        ) => execute_task_create(
+            task_store,
+            subject,
+            description,
+            active_form,
+            blocked_by,
+            acceptance_criteria,
+            verification_command,
+            risk,
+            parent_id,
+            kind,
+        ),
+        (
+            ToolKind::TaskUpdate,
+            ToolInput::TaskUpdate {
+                task_id,
+                status,
+                subject,
+                description,
+                owner,
+                acceptance_criteria,
+                verification_command,
+                risk,
+                parent_id,
+                kind,
+            },
+        ) => execute_task_update(
+            task_store,
+            &task_id,
+            status,
+            subject,
+            description,
+            owner,
+            acceptance_criteria,
+            verification_command,
+            risk,
+            parent_id,
+            kind,
+        ),
+        (
+            ToolKind::TaskList,
+            ToolInput::TaskList {
+                status_filter,
+                owner_filter,
+            },
+        ) => execute_task_list(
+            task_store,
+            status_filter.as_deref(),
+            owner_filter.as_deref(),
+        ),
+        (ToolKind::TaskDone, ToolInput::TaskDone { task_id }) => {
+            execute_task_done(task_store, &task_id)
+        }
+        (ToolKind::TaskStop, ToolInput::TaskStop { task_id }) => execute_task_stop("", &task_id),
+        (ToolKind::TaskGet, ToolInput::TaskGet { task_id }) => {
+            execute_task_get(task_store, &task_id)
+        }
+        (ToolKind::TaskValidate, ToolInput::TaskValidate) => execute_task_validate(task_store),
+        (ToolKind::Task, ToolInput::Task(_)) => {
+            ExecutionResult::failure("Task tool must be dispatched via the streaming executor")
+        }
+        (ToolKind::Skill, ToolInput::Skill { name, args }) => {
+            execute_skill(&name, args.as_deref()).await
+        }
+        (ToolKind::ToolSearch, ToolInput::ToolSearch { query, limit }) => {
+            execute_tool_search(&query, limit, &cwd).await
+        }
+        (ToolKind::ToolSuggest, ToolInput::ToolSuggest { intent, limit }) => {
+            execute_tool_suggest(&intent, limit, &cwd).await
+        }
+        (
+            ToolKind::MemoryCreate,
+            ToolInput::MemoryCreate {
+                level,
+                memory_type,
+                scope,
+                body,
+            },
+        ) => execute_memory_create(&level, &memory_type, &scope, &body, &cwd),
+        (ToolKind::MemoryDelete, ToolInput::MemoryDelete { path }) => execute_memory_delete(&path),
+        (
+            ToolKind::TeamCreate,
+            ToolInput::TeamCreate {
+                team_name,
+                description,
+            },
+        ) => execute_team_create(&team_name, description.as_deref(), &cwd).await,
+        (ToolKind::TeamDelete, ToolInput::TeamDelete) => {
+            execute_team_delete(active_team_name).await
+        }
+        (
+            ToolKind::SendMessage,
+            ToolInput::SendMessage {
+                to,
+                message,
+                summary,
+            },
+        ) => execute_send_message(&to, &message, summary.as_deref(), active_team_name).await,
+        (ToolKind::TeamMemberMode, ToolInput::TeamMemberMode { member_name, mode }) => {
+            execute_team_member_mode(&member_name, &mode, active_team_name).await
+        }
+        (
+            ToolKind::CodeIndex,
+            ToolInput::CodeIndex {
+                path,
+                query,
+                kind,
+                max_entries,
+            },
+        ) => execute_code_index(
+            &cwd,
+            path.as_deref(),
+            query.as_deref(),
+            kind.as_deref(),
+            max_entries,
+        ),
+        (
+            ToolKind::GraphQuery,
+            ToolInput::GraphQuery {
+                query,
+                max_tokens,
+                include_handles,
+            },
+        ) => dispatch_heavy::execute_graph_query(query, max_tokens, include_handles, &cwd),
+        (
+            ToolKind::RunCoverage,
+            ToolInput::RunCoverage {
+                lcov_path,
+                include_untested_list,
+            },
+        ) => dispatch_heavy::execute_run_coverage(lcov_path, include_untested_list, &cwd),
+        (
+            ToolKind::SymbolEdit,
+            ToolInput::SymbolEdit {
+                handle,
+                new_content,
+                validate,
+                dispatch_cascade,
+            },
+        ) => {
+            dispatch_heavy::execute_symbol_edit(
+                handle,
+                new_content,
+                validate,
+                dispatch_cascade,
+                &cwd,
+                task_store,
+            )
+            .await
+        }
+        (
+            ToolKind::PostBounty,
+            ToolInput::PostBounty {
+                description,
+                budget,
+                acceptance_criteria,
+                max_solvers,
+                auto_dispatch,
+            },
+        ) => {
+            dispatch_heavy::execute_post_bounty(
+                description,
+                budget,
+                acceptance_criteria,
+                max_solvers,
+                auto_dispatch,
+                &cwd,
+            )
+            .await
+        }
+        (
+            ToolKind::RunBounty,
+            ToolInput::RunBounty {
+                bounty_id,
+                max_solvers,
+            },
+        ) => dispatch_heavy::execute_run_bounty(bounty_id, max_solvers, &cwd).await,
+        (ToolKind::MarketStatus, ToolInput::MarketStatus { bounty_id }) => {
+            // Try-lock: a bounty cycle in flight holds this mutex for
+            // minutes. Returning a "busy" message lets the model
+            // continue and retry instead of stalling its turn on the
+            // orchestrator. See `economy::market_report_string` for the
+            // same pattern.
+            let Ok(orch) = market_orchestrator().try_lock() else {
+                return ExecutionResult::success(
+                    "Market is busy executing a bounty cycle. \
+                     Re-run market_status once the cycle completes.",
+                );
+            };
+            let detector = match collusion_detector().lock() {
+                Ok(g) => g,
+                Err(e) => {
+                    return ExecutionResult::failure(format!(
+                        "collusion detector mutex poisoned: {e}"
+                    ));
+                }
+            };
+            let report = jfc_economy::reporting::MarketReport::generate(&orch, &detector, 0, 0);
+            let critical = report.health.is_critical();
+            let mut body = format!(
+                "Market: {} bounties total ({} active) · spent {} / remaining {} tok\n\
+                 Health: composite={:.2} (eff={:.2}, fair={:.2}, trust={:.2}, budget={:.2})",
+                report.total_bounties,
+                report.active_bounties,
+                report.total_spent,
+                report.remaining_budget,
+                report.health.composite,
+                report.health.efficiency,
+                report.health.fairness,
+                report.health.trust,
+                report.health.budget_adherence,
+            );
+            if critical {
+                body.push_str(" [CRITICAL]");
+            }
+            if !report.flagged_agents.is_empty() {
+                body.push_str("\nFlagged agents:");
+                for f in &report.flagged_agents {
+                    body.push_str(&format!("\n  - {f}"));
+                }
+            }
+            if let Some(id) = bounty_id
+                && let Some(state) = orch.bounty_state(&id)
+            {
+                body.push_str(&format!("\nBounty `{id}` state: {state:?}"));
+                if matches!(state, jfc_economy::types::MarketState::Open) {
+                    body.push_str(" — call run_bounty to drive Solve→Validate→Settle.");
+                }
+            }
+            ExecutionResult::success(body)
+        }
+        (ToolKind::MultiEdit, ToolInput::MultiEdit { file_path, edits }) => {
+            // Serialize on the same per-file lock used by Edit/Write so
+            // MultiEdit and parallel Edit calls don't race on the same file.
+            let _guard_lock = crate::tools::filesystem::acquire_file_lock(&file_path).await;
+            let _guard = _guard_lock.lock().await;
+            // Apply each edit in order. Each edit sees the previous
+            // edit's output, so later edits can reference text that
+            // earlier edits introduced. Bails on the first edit that
+            // doesn't match — partial application would leave the
+            // file in a half-edited state the model has to recover
+            // from. Same contract as v132.
+            let path = std::path::PathBuf::from(&file_path);
+            let mut content = match tokio::fs::read_to_string(&path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    return ExecutionResult::failure(format!(
+                        "MultiEdit: cannot read {file_path}: {e}"
+                    ));
+                }
+            };
+            let edit_array =
+                match edits.as_array() {
+                    Some(a) => a,
+                    None => return ExecutionResult::failure(
+                        "MultiEdit: `edits` must be an array of {old_string, new_string} objects"
+                            .to_string(),
+                    ),
+                };
+            let mut applied = 0usize;
+            for (i, edit) in edit_array.iter().enumerate() {
+                let old = edit
+                    .get("old_string")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let new_s = edit
+                    .get("new_string")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let replace_all = edit
+                    .get("replace_all")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if old.is_empty() {
+                    return ExecutionResult::failure(format!(
+                        "MultiEdit: edit {} has empty old_string",
+                        i + 1
+                    ));
+                }
+                if !content.contains(old) {
+                    return ExecutionResult::failure(format!(
+                        "MultiEdit: edit {} of {} — old_string not found. \
+                         Earlier edits applied: {applied}. \
+                         Read the file and retry with the current contents.",
+                        i + 1,
+                        edit_array.len()
+                    ));
+                }
+                content = if replace_all {
+                    content.replace(old, new_s)
+                } else {
+                    let occurrences = content.matches(old).count();
+                    if occurrences > 1 {
+                        return ExecutionResult::failure(format!(
+                            "MultiEdit: edit {} matched {occurrences} times — \
+                             pass `replace_all: true` or include more context to disambiguate.",
+                            i + 1
+                        ));
+                    }
+                    content.replacen(old, new_s, 1)
+                };
+                applied += 1;
+            }
+            if let Err(e) = tokio::fs::write(&path, &content).await {
+                return ExecutionResult::failure(format!("MultiEdit: write {file_path}: {e}"));
+            }
+            tracing::info!(
+                target: "jfc::tools::multi_edit",
+                file_path = %file_path,
+                applied,
+                bytes = content.len(),
+                "MultiEdit applied"
+            );
+            invalidate_graph_session_cache(Some(&cwd));
+            record_edited_file(Path::new(&file_path));
+            let result =
+                ExecutionResult::success(format!("Applied {applied} edits to {file_path}."));
+            // Slop guard: check the final content for quality issues.
+            maybe_run_slop_guard(result, Path::new(&file_path), &content, &cwd).await
+        }
+        (
+            ToolKind::AskUserQuestion,
+            ToolInput::AskUserQuestion {
+                question,
+                options,
+                multi_select,
+            },
+        ) => {
+            // Surface the prompt to the user as a special transcript
+            // entry. The user replies with text that the next turn
+            // sees as the tool result. We don't block here because
+            // jfc has no modal-prompt UI yet — the entry pattern is
+            // "post the question, return immediately, treat the next
+            // user message as the answer."
+            let opts_repr: Vec<String> = options
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|opt| {
+                            let label = opt.get("label").and_then(|v| v.as_str())?;
+                            let desc = opt
+                                .get("description")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if desc.is_empty() {
+                                Some(format!("- {label}"))
+                            } else {
+                                Some(format!("- {label} — {desc}"))
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let body = format!(
+                "**Question for you:** {question}\n\n{}\n\n_(Reply with your choice{} as your next message.)_",
+                opts_repr.join("\n"),
+                if multi_select { "(s)" } else { "" }
+            );
+            // The transcript itself surfaces the question; no separate
+            // toast is needed for the user to act on it.
+            tracing::info!(
+                target: "jfc::tools::ask",
+                question = %question.chars().take(80).collect::<String>(),
+                option_count = opts_repr.len(),
+                multi = multi_select,
+                "AskUserQuestion surfaced"
+            );
+            ExecutionResult::success(format!(
+                "{body}\n\n(The user's next message is your tool result.)"
+            ))
+        }
+        (ToolKind::WebFetch, ToolInput::WebFetch { url, prompt }) => {
+            // v132 caches WebFetch results per-URL with a 15-minute TTL so
+            // the model can iterate on a document it just fetched without
+            // re-downloading. Cache HIT returns immediately with a
+            // `<system-reminder>` flag so the model knows the body is from
+            // a previous fetch (matters if the URL was a live endpoint).
+            if let Some(cached) = crate::web_cache::get(&url) {
+                let prompt_hint = prompt
+                    .as_ref()
+                    .map(|p| format!("Focus: {p}\n\n"))
+                    .unwrap_or_default();
+                tracing::debug!(
+                    target: "jfc::tools::webfetch",
+                    %url,
+                    cached_bytes = cached.len(),
+                    "WebFetch cache HIT"
+                );
+                return ExecutionResult::success(format!(
+                    "{}\n\nGET {url} → 200 (cached)\n\n{prompt_hint}{cached}",
+                    crate::system_reminder::format(
+                        "WebFetch result served from cache (last fetch <15min ago). \
+                         If you need fresh content, re-issue with a cache-busting query \
+                         parameter."
+                    ),
+                ));
+            }
+
+            // Use reqwest with a short timeout. Strips HTML to text
+            // when content-type indicates HTML; otherwise returns
+            // the body as-is. The optional `prompt` is *not* applied
+            // here (we don't run a second LLM pass) — it's surfaced
+            // verbatim in the tool result so the model sees its own
+            // intent and can summarize during the next turn.
+            let client = match reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .user_agent("jfc/0.1 (https://github.com/coleleavitt/jfc)")
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => return ExecutionResult::failure(format!("WebFetch: client init: {e}")),
+            };
+            let resp = match client.get(&url).send().await {
+                Ok(r) => r,
+                Err(e) => return ExecutionResult::failure(format!("WebFetch: {url}: {e}")),
+            };
+            let status = resp.status();
+            let content_type = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_owned();
+            let body = resp.text().await.unwrap_or_default();
+            let body = if content_type.contains("html") {
+                // Cheap HTML→text: strip tags. A real impl would use
+                // scraper/html5ever; this is an MVP.
+                strip_html_tags(&body)
+            } else {
+                body
+            };
+            // Cap to 50 KB so the tool result doesn't blow context.
+            let truncated = if body.len() > 50_000 {
+                format!(
+                    "{}\n\n[...truncated, full {} bytes]",
+                    &body[..50_000],
+                    body.len()
+                )
+            } else {
+                body
+            };
+            // Cache successful 2xx responses only — caching errors would
+            // mask transient outages on retry.
+            if status.is_success() {
+                crate::web_cache::put(&url, truncated.clone());
+            }
+            let prompt_hint = prompt
+                .as_ref()
+                .map(|p| format!("Focus: {p}\n\n"))
+                .unwrap_or_default();
+            ExecutionResult::success(format!("GET {url} → {status}\n\n{prompt_hint}{truncated}"))
+        }
+        (ToolKind::WebSearch, ToolInput::WebSearch { query, max_results }) => {
+            let num = max_results.unwrap_or(5) as usize;
+            match crate::web_search::search(&query, num).await {
+                Ok(results) => ExecutionResult::success(results),
+                Err(e) => ExecutionResult::failure(e),
+            }
+        }
+        (ToolKind::ExitPlanMode, ToolInput::ExitPlanMode { plan }) => {
+            // Hand the plan off to the UI thread so all permission-mode
+            // mutations stay on a single task. The model's tool result
+            // is the success acknowledgment — the actual mode flip
+            // happens when the main loop drains `UiEvent::ExitPlanModeRequested`.
+            if let Some(tx) = snapshot_event_sender() {
+                let _ = tx
+                    .send(crate::runtime::AppEvent::Ui(
+                        crate::runtime::UiEvent::ExitPlanModeRequested { plan: plan.clone() },
+                    ))
+                    .await;
+                tracing::info!(
+                    target: "jfc::tools::plan_mode",
+                    plan_bytes = plan.len(),
+                    "ExitPlanMode dispatched to UI thread"
+                );
+                ExecutionResult::success(
+                    "Plan presented to user. Permission mode transitions \
+                     from Plan to AcceptEdits — you may now perform the \
+                     destructive operations described in the plan."
+                        .to_string(),
+                )
+            } else {
+                tracing::warn!(
+                    target: "jfc::tools::plan_mode",
+                    "ExitPlanMode called but no AppEvent sender registered"
+                );
+                ExecutionResult::failure(
+                    "ExitPlanMode failed: UI event channel unavailable.".to_string(),
+                )
+            }
+        }
+        (ToolKind::Mcp(advertised_name), ToolInput::Mcp { arguments, .. }) => {
+            // Route through the global MCP registry. The registry is
+            // populated at startup from `[mcp.<name>]` config blocks;
+            // if it's missing, MCP isn't wired in this build (e.g.
+            // headless test) — surface a clean failure so the model
+            // can recover rather than thinking the call hung.
+            let Some(registry) = snapshot_mcp_registry() else {
+                return ExecutionResult::failure(
+                    "MCP registry not initialized — restart jfc with the MCP module enabled."
+                        .to_string(),
+                );
+            };
+            match crate::mcp::dispatch_tool(&registry, &advertised_name, arguments).await {
+                Ok(outcome) if outcome.is_error => ExecutionResult::failure(outcome.text),
+                Ok(outcome) => ExecutionResult::success(outcome.text),
+                Err(e) => ExecutionResult::failure(format!("MCP dispatch failed: {e}")),
+            }
+        }
+        (
+            ToolKind::CronCreate,
+            ToolInput::CronCreate {
+                schedule,
+                command,
+                description,
+            },
+        ) => execute_cron_create(&schedule, &command, &description),
+        (ToolKind::CronList, ToolInput::CronList) => execute_cron_list(),
+        (ToolKind::CronDelete, ToolInput::CronDelete { id }) => execute_cron_delete(&id),
+        (
+            ToolKind::ScheduleWakeup,
+            ToolInput::ScheduleWakeup {
+                delay_seconds,
+                prompt,
+                reason,
+            },
+        ) => execute_schedule_wakeup(delay_seconds, &prompt, &reason),
+        (ToolKind::Monitor, ToolInput::Monitor { command, until }) => {
+            execute_monitor(&command, &until, &cwd).await
+        }
+        (
+            ToolKind::Lsp,
+            ToolInput::Lsp {
+                kind: req_kind,
+                file,
+                line,
+                column,
+            },
+        ) => execute_lsp(&req_kind, &file, line, column, &cwd).await,
+        (ToolKind::PushNotification, ToolInput::PushNotification { message, title }) => {
+            execute_push_notification(&message, title.as_deref())
+        }
+        (
+            ToolKind::RemoteTrigger,
+            ToolInput::RemoteTrigger {
+                trigger_id,
+                payload,
+            },
+        ) => execute_remote_trigger(&trigger_id, payload.as_ref()).await,
+        (ToolKind::EnterPlanMode, ToolInput::EnterPlanMode { reason }) => {
+            execute_enter_plan_mode(&reason).await
+        }
+        (ToolKind::EnterWorktree, ToolInput::EnterWorktree { name, branch }) => {
+            execute_enter_worktree(&name, branch.as_deref(), &cwd).await
+        }
+        (ToolKind::ExitWorktree, ToolInput::ExitWorktree) => execute_exit_worktree(&cwd).await,
+        (ToolKind::NotebookRead, ToolInput::NotebookRead { path }) => {
+            execute_notebook_read(&path).await
+        }
+        (
+            ToolKind::NotebookEdit,
+            ToolInput::NotebookEdit {
+                path,
+                cell_id,
+                new_source,
+                edit_mode,
+            },
+        ) => execute_notebook_edit(&path, &cell_id, &new_source, edit_mode.as_deref()).await,
+        (ToolKind::ScratchpadRead, ToolInput::ScratchpadRead { key }) => {
+            execute_scratchpad_read(&key)
+        }
+        (ToolKind::ScratchpadWrite, ToolInput::ScratchpadWrite { key, value }) => {
+            execute_scratchpad_write(&key, &value)
+        }
+        (kind, input) => ExecutionResult::failure(format!(
+            "tool input mismatch: {kind:?} was paired with an incompatible \
+             ToolInput variant ({}). This is a routing bug — the tool's \
+             implementation exists but the parsed input didn't match its \
+             expected shape.",
+            input.summary()
+        )),
+    }
+}

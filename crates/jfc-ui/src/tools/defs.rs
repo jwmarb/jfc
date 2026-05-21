@@ -1,4 +1,4 @@
-use crate::provider::ToolDef;
+use jfc_provider::ToolDef;
 
 pub fn all_tool_defs() -> Vec<ToolDef> {
     vec![
@@ -271,6 +271,20 @@ pub fn all_tool_defs() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "TaskStop".into(),
+            description: "Stop a running background task/agent by its task ID. The task will be cancelled and its resources released.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "The background task id to stop (e.g. 'tooluse_abc123')"
+                    }
+                },
+                "required": ["task_id"]
+            }),
+        },
+        ToolDef {
             name: "TaskGet".into(),
             description: "Retrieve a task by ID.".into(),
             input_schema: serde_json::json!({
@@ -521,6 +535,39 @@ pub fn all_tool_defs() -> Vec<ToolDef> {
                     }
                 },
                 "required": ["member_name", "mode"]
+            }),
+        },
+        ToolDef {
+            name: "code_index".into(),
+            description: "Return a compact API/symbol index from the cached project code graph. \
+                Use this before broad file reads when you need to discover modules, functions, \
+                structs, enums, traits, or chainable symbol handles. Optional filters keep output \
+                small: `path` narrows to a file/directory, `query` matches symbol names or paths, \
+                and `kind` accepts function|struct|enum|module|trait. Output is grouped by file \
+                and includes handles like `fn:crate::module::name` for graph_query or symbol_edit."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Optional file or directory substring to filter symbols, relative or absolute."
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Optional case-insensitive substring matched against symbol names, qualified names, and file paths."
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": "Optional symbol kind filter.",
+                        "enum": ["function", "struct", "enum", "module", "trait"]
+                    },
+                    "max_entries": {
+                        "type": "number",
+                        "description": "Maximum symbols to show. Default 80, capped at 200."
+                    }
+                },
+                "required": []
             }),
         },
         ToolDef {
@@ -893,15 +940,16 @@ pub fn all_tool_defs() -> Vec<ToolDef> {
         ToolDef {
             name: "LSP".into(),
             description: "Query the language server for `hover`, `definition`, \
-                or `references` at a specific source location. Uses the \
-                already-spawned LSP client (rust-analyzer / zls / etc.) — \
-                returns an error if no LSP is running for the workspace.".into(),
+                `references`, `implementation`, `type_definition`, `document_symbols`, \
+                `workspace_symbols`, `incoming_calls`, or `outgoing_calls` at a specific \
+                source location. Uses the already-spawned LSP client (rust-analyzer / zls / \
+                etc.) — returns an error if no LSP is running for the workspace.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "kind": {
                         "type": "string",
-                        "enum": ["hover", "definition", "references"],
+                        "enum": ["hover", "definition", "references", "implementation", "type_definition", "document_symbols", "workspace_symbols", "incoming_calls", "outgoing_calls"],
                         "description": "Which LSP request to issue."
                     },
                     "file": {
@@ -915,6 +963,10 @@ pub fn all_tool_defs() -> Vec<ToolDef> {
                     "column": {
                         "type": "number",
                         "description": "1-indexed column number of the symbol position."
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Search query for workspace_symbols. Ignored for other kinds."
                     }
                 },
                 "required": ["kind", "file", "line", "column"]
